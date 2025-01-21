@@ -76,8 +76,8 @@ class STT(stt.STT):
         if sample_rate not in [8000, 16000]:
             raise ValueError("Sample rate must be 8000 or 16000 Hz")
 
-        client_id = client_id
-        client_secret = client_secret
+        client_id = client_id or os.environ.get("RTZR_CLIENT_ID")
+        client_secret = client_secret or os.environ.get("RTZR_CLIENT_SECRET")
         if not client_id or not client_secret:
             raise ValueError(
                 "Must provide RTZR credentials (args or RTZR_CLIENT_ID/RTZR_CLIENT_SECRET env)."
