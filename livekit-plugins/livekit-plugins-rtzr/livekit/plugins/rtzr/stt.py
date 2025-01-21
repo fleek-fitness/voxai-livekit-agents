@@ -1,17 +1,3 @@
-# Copyright 2023 LiveKit, Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from __future__ import annotations
 
 import asyncio
@@ -191,6 +177,7 @@ class STT(stt.STT):
         if keywords is not None:
             self._config.keywords = keywords
 
+        # Update existing streams
         for stream in self._streams:
             stream.update_options(
                 language=language,
@@ -209,8 +196,7 @@ class STT(stt.STT):
         This is required by the base STT class but RTZR primarily supports streaming.
         """
         raise NotImplementedError(
-            "RTZR STT only supports streaming recognition. "
-            "Use stream() method instead."
+            "RTZR STT only supports streaming recognition. Use stream() instead."
         )
 
     async def close(self):
@@ -225,7 +211,7 @@ def _validate_keywords(keywords: List[Tuple[str, float]]) -> List[str]:
     """Validate and format keywords according to RTZR specifications."""
     formatted_keywords = []
     for word, score in keywords:
-        # Validate word format (Korean syllables and spaces only)
+        # Validate word format (Korean syllables and spaces only, as an example)
         if not all(c.isspace() or (0xAC00 <= ord(c) <= 0xD7A3) for c in word):
             raise ValueError(
                 f"Keyword '{word}' must contain only Korean syllables and spaces"
@@ -241,7 +227,7 @@ def _validate_keywords(keywords: List[Tuple[str, float]]) -> List[str]:
         if score is not None and not (-5.0 <= score <= 5.0):
             raise ValueError(f"Score for keyword '{word}' must be between -5.0 and 5.0")
 
-        # Format keyword string
+        # Format keyword string for gRPC request
         if score is None:
             formatted_keywords.append(word)  # Will use default score of 2.0
         else:
@@ -273,108 +259,6 @@ class SpeechStream(stt.SpeechStream):
         self._closed = False
         self._bytes_per_sample = 2
 
-    async def _process_result(self, result) -> None:
-        """Process a single result from the RTZR API."""
-        if not result.alternatives:
-            return
-
-        # Convert RTZR result to SpeechData format
-        speech_data = stt.SpeechData(
-            language=self._config.language,
-            start_time=0,  # RTZR doesn't provide word-level timing
-            end_time=0,  # RTZR doesn't provide word-level timing
-            confidence=(
-                result.alternatives[0].confidence
-                if hasattr(result.alternatives[0], "confidence")
-                else 1.0
-            ),
-            text=result.alternatives[0].text,
-        )
-
-        # Use _emit instead of emit_speech
-        await self._emit(speech_data)
-
-    async def _run(self) -> None:
-        channel = None
-        try:
-            channel = grpc.aio.secure_channel(
-                GRPC_SERVER_URL,
-                credentials=grpc.ssl_channel_credentials(),
-            )
-
-            from . import vito_stt_client_pb2 as pb
-            from . import vito_stt_client_pb2_grpc as pb_grpc
-
-            stub = pb_grpc.OnlineDecoderStub(channel)
-
-            async def request_iterator():
-                try:
-                    decoder_config = pb.DecoderConfig(
-                        sample_rate=self._config.sample_rate,
-                        encoding=pb.DecoderConfig.AudioEncoding.LINEAR16,
-                        model_name=self._config.model,
-                        use_itn=self._config.use_itn,
-                        use_disfluency_filter=self._config.use_disfluency_filter,
-                        use_profanity_filter=self._config.use_profanity_filter,
-                        keywords=_validate_keywords(self._config.keywords),
-                    )
-                    yield pb.DecoderRequest(streaming_config=decoder_config)
-
-                    async for frame in self._input_ch:
-                        if isinstance(frame, rtc.AudioFrame):
-                            try:
-                                data = frame.data.tobytes()
-                                if len(data) > 1024 * 1024:
-                                    data = data[: 1024 * 1024]
-                                yield pb.DecoderRequest(audio_content=data)
-                            finally:
-                                frame = None
-                except Exception as e:
-                    logger.error(f"Error in request_iterator: {e}")
-                    raise
-
-            cred = grpc.access_token_call_credentials(self._token_getter())
-
-            try:
-                async for response in stub.Decode(request_iterator(), credentials=cred):
-                    if response and response.results:
-                        for result in response.results:
-                            try:
-                                await self._process_result(result)
-                            except Exception as e:
-                                logger.error(f"Error processing result: {e}")
-                            finally:
-                                del result
-                    del response
-            except asyncio.CancelledError:
-                logger.debug("Stream cancelled")
-                raise
-            except Exception as e:
-                logger.error(f"Error in response processing: {e}")
-                raise
-
-        except grpc.RpcError as e:
-            if e.code() == grpc.StatusCode.UNAUTHENTICATED:
-                raise APIStatusError("Authentication failed", status_code=401)
-            elif e.code() == grpc.StatusCode.INVALID_ARGUMENT:
-                raise APIStatusError("Invalid parameters", status_code=400)
-            elif e.code() == grpc.StatusCode.RESOURCE_EXHAUSTED:
-                raise APIStatusError(
-                    "Resource exhausted or payment required", status_code=429
-                )
-            elif e.code() == grpc.StatusCode.INTERNAL:
-                raise APIStatusError("Internal server error", status_code=500)
-            else:
-                raise APIConnectionError() from e
-        except Exception as e:
-            raise APIConnectionError() from e
-        finally:
-            if channel:
-                try:
-                    await channel.close()
-                except Exception as e:
-                    logger.error(f"Error closing channel: {e}")
-
     def update_options(
         self,
         *,
@@ -400,6 +284,13 @@ class SpeechStream(stt.SpeechStream):
 
         self._closed = False
 
+    def push_frame(self, frame: rtc.AudioFrame) -> None:
+        """Override push_frame to check closed state."""
+        if self._closed:
+            logger.warning("Attempting to push frame to a closed stream.")
+            return
+        super().push_frame(frame)
+
     async def close(self):
         """Properly close the stream."""
         if not self._closed:
@@ -407,20 +298,112 @@ class SpeechStream(stt.SpeechStream):
             try:
                 if self._input_ch:
                     await self._input_ch.close()
-                # Wait for any pending operations to complete
+                # Wait for any pending tasks to complete
                 await asyncio.sleep(0)
             finally:
                 await super().close()
 
-    def push_frame(self, frame: rtc.AudioFrame) -> None:
-        """Override push_frame to check closed state."""
-        if self._closed:
-            logger.warning("Attempting to push frame to closed stream")
-            return
-        super().push_frame(frame)
+    async def _run(self) -> None:
+        channel = None
+        try:
+            channel = grpc.aio.secure_channel(
+                GRPC_SERVER_URL, grpc.ssl_channel_credentials()
+            )
 
-    def _check_not_closed(self) -> None:
-        """Override to use our closed flag."""
-        if self._closed:
-            cls = self.__class__
-            raise RuntimeError(f"{cls.__module__}.{cls.__name__} is closed")
+            # Import your generated stubs
+            from . import vito_stt_client_pb2 as pb
+            from . import vito_stt_client_pb2_grpc as pb_grpc
+
+            stub = pb_grpc.OnlineDecoderStub(channel)
+
+            async def request_iterator():
+                """
+                Asynchronously yield `DecoderRequest` messages for the gRPC call.
+                """
+                try:
+                    decoder_config = pb.DecoderConfig(
+                        sample_rate=self._config.sample_rate,
+                        encoding=pb.DecoderConfig.AudioEncoding.LINEAR16,
+                        model_name=self._config.model,
+                        use_itn=self._config.use_itn,
+                        use_disfluency_filter=self._config.use_disfluency_filter,
+                        use_profanity_filter=self._config.use_profanity_filter,
+                        keywords=_validate_keywords(self._config.keywords),
+                    )
+                    # First message must contain the streaming config
+                    yield pb.DecoderRequest(streaming_config=decoder_config)
+
+                    # Subsequent messages carry raw audio frames
+                    async for frame in self._input_ch:
+                        if isinstance(frame, rtc.AudioFrame):
+                            data = frame.data.tobytes()
+                            # Safety limit if you want to avoid huge frames
+                            if len(data) > 1024 * 1024:
+                                data = data[: 1024 * 1024]
+                            yield pb.DecoderRequest(audio_content=data)
+                except Exception as e:
+                    logger.error(f"Error in request_iterator: {e}")
+                    raise
+
+            # Attach access token credentials for the call
+            cred = grpc.access_token_call_credentials(self._token_getter())
+
+            # Make the streaming gRPC call
+            async for response in stub.Decode(request_iterator(), credentials=cred):
+                # Each response can contain multiple results
+                if response and response.results:
+                    for result in response.results:
+                        if not result.alternatives:
+                            continue
+
+                        alt = result.alternatives[0]
+                        if not alt.text:
+                            continue
+
+                        # Mark transcript type: interim or final
+                        if result.is_final:
+                            event_type = stt.SpeechEventType.FINAL_TRANSCRIPT
+                        else:
+                            event_type = stt.SpeechEventType.INTERIM_TRANSCRIPT
+
+                        # Convert RTZR result to the SpeechData structure
+                        speech_data = stt.SpeechData(
+                            language=self._config.language,
+                            start_time=0.0,  # RTZR doesn't provide start/end times
+                            end_time=0.0,
+                            confidence=alt.confidence if alt.confidence else 1.0,
+                            text=alt.text,
+                        )
+
+                        # Emit the partial (interim) or final transcript
+                        await self._emit(
+                            stt.SpeechEvent(
+                                type=event_type,
+                                alternatives=[speech_data],
+                            )
+                        )
+
+        except grpc.RpcError as e:
+            # Handle common gRPC errors in a manner similar to Google STT
+            if e.code() == grpc.StatusCode.UNAUTHENTICATED:
+                raise APIStatusError("Authentication failed", status_code=401)
+            elif e.code() == grpc.StatusCode.INVALID_ARGUMENT:
+                raise APIStatusError("Invalid parameters", status_code=400)
+            elif e.code() == grpc.StatusCode.RESOURCE_EXHAUSTED:
+                raise APIStatusError(
+                    "Resource exhausted or payment required", status_code=429
+                )
+            elif e.code() == grpc.StatusCode.INTERNAL:
+                raise APIStatusError("Internal server error", status_code=500)
+            else:
+                raise APIConnectionError() from e
+
+        except Exception as e:
+            raise APIConnectionError() from e
+
+        finally:
+            if channel:
+                try:
+                    await channel.close()
+                except Exception as e:
+                    logger.error(f"Error closing gRPC channel: {e}")
