@@ -281,7 +281,7 @@ class SpeechStream(stt.SpeechStream):
         # Convert RTZR result to SpeechData format
         speech_data = stt.SpeechData(
             text=result.alternatives[0].text,
-            is_final=result.is_final,
+            final=result.is_final,
             confidence=(
                 result.alternatives[0].confidence
                 if hasattr(result.alternatives[0], "confidence")
