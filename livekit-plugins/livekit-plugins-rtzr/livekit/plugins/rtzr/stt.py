@@ -243,6 +243,7 @@ class SpeechStream(stt.SpeechStream):
         self._token_getter = token_getter
         self._reconnect_event = asyncio.Event()
         self._speaking = False
+        self._closed = False
 
     async def _run(self) -> None:
         channel = None
@@ -261,7 +262,6 @@ class SpeechStream(stt.SpeechStream):
 
             async def request_iterator():
                 try:
-                    # First request with config
                     decoder_config = pb.DecoderConfig(
                         sample_rate=self._config.sample_rate,
                         encoding=pb.DecoderConfig.AudioEncoding.LINEAR16,
@@ -273,17 +273,19 @@ class SpeechStream(stt.SpeechStream):
                     )
                     yield pb.DecoderRequest(streaming_config=decoder_config)
 
-                    # Stream audio data
-                    async for frame in self._input_ch:
-                        if isinstance(frame, rtc.AudioFrame):
-                            try:
-                                yield pb.DecoderRequest(
-                                    audio_content=frame.data.tobytes()
-                                )
-                            finally:
-                                # Ensure frame data is cleared
-                                del frame.data
-                                del frame
+                    while not self._closed:
+                        try:
+                            frame = await self._input_ch.get()
+                            if isinstance(frame, rtc.AudioFrame):
+                                try:
+                                    yield pb.DecoderRequest(
+                                        audio_content=frame.data.tobytes()
+                                    )
+                                finally:
+                                    del frame.data
+                                    del frame
+                        except asyncio.CancelledError:
+                            break
                 except Exception as e:
                     logger.error(f"Error in request_iterator: {e}")
                     raise
@@ -318,6 +320,7 @@ class SpeechStream(stt.SpeechStream):
         except Exception as e:
             raise APIConnectionError() from e
         finally:
+            self._closed = True
             if channel:
                 try:
                     await channel.close()
@@ -348,3 +351,28 @@ class SpeechStream(stt.SpeechStream):
             self._config.keywords = keywords
 
         self._reconnect_event.set()
+
+    async def close(self):
+        """Properly close the stream."""
+        if not self._closed:
+            self._closed = True
+            try:
+                if self._input_ch:
+                    await self._input_ch.close()
+                # Wait for any pending operations to complete
+                await asyncio.sleep(0)
+            finally:
+                await super().close()
+
+    def push_frame(self, frame: rtc.AudioFrame) -> None:
+        """Override push_frame to check closed state."""
+        if self._closed:
+            logger.warning("Attempting to push frame to closed stream")
+            return
+        super().push_frame(frame)
+
+    def _check_not_closed(self) -> None:
+        """Override to use our closed flag."""
+        if self._closed:
+            cls = self.__class__
+            raise RuntimeError(f"{cls.__module__}.{cls.__name__} is closed")
