@@ -21,8 +21,6 @@ from livekit.agents import (
     utils,
 )
 
-from . import vito_stt_client_pb2 as pb
-from . import vito_stt_client_pb2_grpc as pb_grpc
 from .log import logger
 from .models import RTZRLanguages, RTZRModels
 
@@ -88,24 +86,8 @@ class STT(stt.STT):
         self._session = requests.Session()
         self._token = None
         self._token_expire = 0
+
         self._streams = weakref.WeakSet[SpeechStream]()
-
-        # Create shared gRPC channel with optimized settings
-        self._channel = grpc.aio.secure_channel(
-            GRPC_SERVER_URL,
-            credentials=grpc.ssl_channel_credentials(),
-            options=[
-                ("grpc.keepalive_time_ms", 30000),
-                ("grpc.keepalive_timeout_ms", 10000),
-                ("grpc.http2.min_time_between_pings_ms", 10000),
-                ("grpc.http2.max_pings_without_data", 0),
-                ("grpc.enable_retries", 0),
-            ],
-        )
-
-        # Create shared stub
-        self._stub = pb_grpc.OnlineDecoderStub(self._channel)
-
         self._config = STTOptions(
             language=language,
             model=model,
@@ -203,12 +185,8 @@ class STT(stt.STT):
         raise NotImplementedError("RTZR plugin supports streaming only.")
 
     async def close(self):
-        """Close the STT instance and all resources."""
         for stream in list(self._streams):
             await stream.close()
-        if self._channel is not None:
-            await self._channel.close()
-            self._channel = None
         self._session.close()
         await super().close()
 
@@ -293,11 +271,20 @@ class SpeechStream(stt.SpeechStream):
             await super().close()
 
     async def _run(self) -> None:
+        channel = None
         try:
+            # secure gRPC channel
+            channel = grpc.aio.secure_channel(
+                GRPC_SERVER_URL,
+                credentials=grpc.ssl_channel_credentials(),
+            )
+            from . import vito_stt_client_pb2 as pb
+            from . import vito_stt_client_pb2_grpc as pb_grpc
+
+            stub = pb_grpc.OnlineDecoderStub(channel)
 
             async def request_iterator():
                 try:
-                    # Send initial config
                     decoder_config = pb.DecoderConfig(
                         sample_rate=self._config.sample_rate,
                         encoding=pb.DecoderConfig.AudioEncoding.LINEAR16,
@@ -307,68 +294,78 @@ class SpeechStream(stt.SpeechStream):
                         use_profanity_filter=self._config.use_profanity_filter,
                         keywords=_validate_keywords(self._config.keywords),
                     )
+                    # first message => streaming config
                     yield pb.DecoderRequest(streaming_config=decoder_config)
 
-                    # Stream audio frames immediately without buffering
                     async for frame in self._input_ch:
                         if isinstance(frame, rtc.AudioFrame):
-                            try:
-                                # Send frame data directly without size limit
-                                yield pb.DecoderRequest(
-                                    audio_content=frame.data.tobytes()
-                                )
-                            finally:
-                                frame = None
+                            data = frame.data.tobytes()
+                            # optional limit
+                            if len(data) > 1024 * 1024:
+                                data = data[: 1024 * 1024]
+                            yield pb.DecoderRequest(audio_content=data)
                 except Exception as e:
                     logger.error(f"Error in request_iterator: {e}")
                     raise
 
-            # Use shared stub with token credentials
+            # attach credentials
             cred = grpc.access_token_call_credentials(self._token_getter())
 
-            # Process responses
-            async for response in self._stt._stub.Decode(
-                request_iterator(), credentials=cred
-            ):
-                if response and response.results:
-                    for result in response.results:
-                        if not result.alternatives:
-                            continue
+            async for response in stub.Decode(request_iterator(), credentials=cred):
+                if not response or not response.results:
+                    continue
 
-                        alt = result.alternatives[0]
-                        if not alt.text:
-                            continue
+                # Process each result
+                for result in response.results:
+                    # If no alt => skip
+                    if not result.alternatives:
+                        continue
 
-                        # Create and emit speech event immediately
-                        self._event_ch.send_nowait(
-                            stt.SpeechEvent(
-                                type=(
-                                    stt.SpeechEventType.FINAL_TRANSCRIPT
-                                    if result.is_final
-                                    else stt.SpeechEventType.INTERIM_TRANSCRIPT
-                                ),
-                                alternatives=[
-                                    stt.SpeechData(
-                                        language=self._config.language,
-                                        start_time=0,
-                                        end_time=0,
-                                        confidence=getattr(alt, "confidence", 1.0),
-                                        text=alt.text,
-                                    )
-                                ],
-                            )
+                    alt = result.alternatives[0]
+                    if not alt.text:
+                        continue
+
+                    # RTZR sets is_final => final vs partial transcript
+                    if result.is_final:
+                        event_type = stt.SpeechEventType.FINAL_TRANSCRIPT
+                    else:
+                        event_type = stt.SpeechEventType.INTERIM_TRANSCRIPT
+
+                    speech_data = stt.SpeechData(
+                        language=self._config.language,
+                        start_time=0.0,  # RTZR doesn't return word timestamps
+                        end_time=0.0,
+                        confidence=alt.confidence if alt.confidence else 1.0,
+                        text=alt.text,
+                    )
+
+                    # Instead of self._emit(...), we do:
+                    self._event_ch.send_nowait(
+                        stt.SpeechEvent(
+                            type=event_type,
+                            alternatives=[speech_data],
                         )
+                    )
 
         except grpc.RpcError as e:
+            # Similar to google/deepgram error handling
             if e.code() == grpc.StatusCode.UNAUTHENTICATED:
                 raise APIStatusError("Authentication failed", status_code=401)
             elif e.code() == grpc.StatusCode.INVALID_ARGUMENT:
                 raise APIStatusError("Invalid parameters", status_code=400)
             elif e.code() == grpc.StatusCode.RESOURCE_EXHAUSTED:
-                raise APIStatusError("Resource exhausted", status_code=429)
+                raise APIStatusError("Resource exhausted / Over quota", status_code=429)
             elif e.code() == grpc.StatusCode.INTERNAL:
                 raise APIStatusError("Internal server error", status_code=500)
             else:
                 raise APIConnectionError() from e
+
         except Exception as e:
             raise APIConnectionError() from e
+
+        finally:
+            if channel:
+                try:
+                    await channel.close()
+                except Exception as e:
+                    logger.error(f"Error closing RTZR gRPC channel: {e}")
