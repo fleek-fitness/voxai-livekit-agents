@@ -280,14 +280,15 @@ class SpeechStream(stt.SpeechStream):
 
         # Convert RTZR result to SpeechData format
         speech_data = stt.SpeechData(
-            text=result.alternatives[0].text,
-            final=result.is_final,
+            language=self._config.language,
+            start_time=0,  # RTZR doesn't provide word-level timing
+            end_time=0,  # RTZR doesn't provide word-level timing
             confidence=(
                 result.alternatives[0].confidence
                 if hasattr(result.alternatives[0], "confidence")
                 else 1.0
             ),
-            language=self._config.language,
+            text=result.alternatives[0].text,
         )
 
         # Emit the speech data
