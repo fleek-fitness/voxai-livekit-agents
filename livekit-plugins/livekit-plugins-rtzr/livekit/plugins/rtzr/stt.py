@@ -271,7 +271,27 @@ class SpeechStream(stt.SpeechStream):
         self._config = config
         self._token_getter = token_getter
         self._closed = False
-        self._bytes_per_sample = 2  # Match example's BYTES_PER_SAMPLE
+        self._bytes_per_sample = 2
+
+    async def _process_result(self, result) -> None:
+        """Process a single result from the RTZR API."""
+        if not result.alternatives:
+            return
+
+        # Convert RTZR result to SpeechData format
+        speech_data = stt.SpeechData(
+            text=result.alternatives[0].text,
+            is_final=result.is_final,
+            confidence=(
+                result.alternatives[0].confidence
+                if hasattr(result.alternatives[0], "confidence")
+                else 1.0
+            ),
+            language=self._config.language,
+        )
+
+        # Emit the speech data
+        await self.emit_speech(speech_data)
 
     async def _run(self) -> None:
         channel = None
@@ -307,7 +327,6 @@ class SpeechStream(stt.SpeechStream):
                                     data = data[: 1024 * 1024]
                                 yield pb.DecoderRequest(audio_content=data)
                             finally:
-                                # Let the frame be garbage collected naturally
                                 frame = None
                 except Exception as e:
                     logger.error(f"Error in request_iterator: {e}")
@@ -315,12 +334,23 @@ class SpeechStream(stt.SpeechStream):
 
             cred = grpc.access_token_call_credentials(self._token_getter())
 
-            async for response in stub.Decode(request_iterator(), credentials=cred):
-                if response and response.results:
-                    for result in response.results:
-                        await self._process_result(result)
-                        del result
-                del response
+            try:
+                async for response in stub.Decode(request_iterator(), credentials=cred):
+                    if response and response.results:
+                        for result in response.results:
+                            try:
+                                await self._process_result(result)
+                            except Exception as e:
+                                logger.error(f"Error processing result: {e}")
+                            finally:
+                                del result
+                    del response
+            except asyncio.CancelledError:
+                logger.debug("Stream cancelled")
+                raise
+            except Exception as e:
+                logger.error(f"Error in response processing: {e}")
+                raise
 
         except grpc.RpcError as e:
             if e.code() == grpc.StatusCode.UNAUTHENTICATED:
