@@ -291,8 +291,8 @@ class SpeechStream(stt.SpeechStream):
             text=result.alternatives[0].text,
         )
 
-        # Emit the speech data
-        await self.emit_speech(speech_data)
+        # Use _emit instead of emit_speech
+        await self._emit(speech_data)
 
     async def _run(self) -> None:
         channel = None
