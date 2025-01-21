@@ -71,9 +71,16 @@ class STT(stt.STT):
         """
         Create a new instance of RTZR STT.
 
-        Credentials must be provided either through arguments or environment variables:
-        - RTZR_CLIENT_ID
-        - RTZR_CLIENT_SECRET
+        Args:
+            model: The RTZR model to use
+            language: The language code (e.g., "ko-KR")
+            sample_rate: Audio sample rate in Hz
+            use_itn: Enable inverse text normalization
+            use_disfluency_filter: Enable disfluency filter
+            use_profanity_filter: Enable profanity filter
+            keywords: List of keyword tuples (word, boost)
+            client_id: RTZR client ID
+            client_secret: RTZR client secret
         """
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -81,6 +88,16 @@ class STT(stt.STT):
                 interim_results=True,
             )
         )
+
+        # Validate model and language
+        if not isinstance(model, (str, RTZRModels)):
+            raise ValueError(f"Invalid model type: {type(model)}")
+        if not isinstance(language, (str, RTZRLanguages)):
+            raise ValueError(f"Invalid language type: {type(language)}")
+
+        # Validate sample rate
+        if sample_rate not in [8000, 16000]:
+            raise ValueError("Sample rate must be either 8000 or 16000 Hz")
 
         client_id = client_id or os.environ.get("RTZR_CLIENT_ID")
         client_secret = client_secret or os.environ.get("RTZR_CLIENT_SECRET")
@@ -96,6 +113,7 @@ class STT(stt.STT):
         self._token = None
         self._token_expire = 0
         self._session = requests.Session()
+        self._streams = weakref.WeakSet[SpeechStream]()
 
         self._config = STTOptions(
             language=language,
@@ -107,22 +125,26 @@ class STT(stt.STT):
             use_profanity_filter=use_profanity_filter,
             keywords=keywords,
         )
-        self._streams = weakref.WeakSet[SpeechStream]()
 
     def _get_token(self) -> str:
-        if not self._token or time.time() >= self._token_expire:
-            resp = self._session.post(
-                f"{API_BASE}/v1/authenticate",
-                data={
-                    "client_id": self._client_id,
-                    "client_secret": self._client_secret,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            self._token = data["access_token"]
-            self._token_expire = data["expire_at"]
-        return self._token
+        """Get or refresh the authentication token."""
+        try:
+            if not self._token or time.time() >= self._token_expire:
+                resp = self._session.post(
+                    f"{API_BASE}/v1/authenticate",
+                    data={
+                        "client_id": self._client_id,
+                        "client_secret": self._client_secret,
+                    },
+                    timeout=10,  # Add timeout
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                self._token = data["access_token"]
+                self._token_expire = data["expire_at"]
+            return self._token
+        except requests.exceptions.RequestException as e:
+            raise APIConnectionError("Failed to get authentication token") from e
 
     def stream(
         self,
@@ -190,6 +212,13 @@ class STT(stt.STT):
             "RTZR STT only supports streaming recognition. "
             "Use stream() method instead."
         )
+
+    async def close(self):
+        """Close the STT instance and all active streams."""
+        for stream in list(self._streams):
+            await stream.close()
+        self._session.close()
+        await super().close()
 
 
 def _validate_keywords(keywords: List[Tuple[str, float]]) -> List[str]:
