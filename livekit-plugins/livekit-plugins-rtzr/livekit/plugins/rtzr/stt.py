@@ -299,7 +299,6 @@ class SpeechStream(stt.SpeechStream):
                     )
                     yield pb.DecoderRequest(streaming_config=decoder_config)
 
-                    # Use async iteration instead of get()
                     async for frame in self._input_ch:
                         if isinstance(frame, rtc.AudioFrame):
                             try:
@@ -308,8 +307,8 @@ class SpeechStream(stt.SpeechStream):
                                     data = data[: 1024 * 1024]
                                 yield pb.DecoderRequest(audio_content=data)
                             finally:
-                                del frame.data
-                                del frame
+                                # Let the frame be garbage collected naturally
+                                frame = None
                 except Exception as e:
                     logger.error(f"Error in request_iterator: {e}")
                     raise
