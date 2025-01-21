@@ -245,20 +245,22 @@ class SpeechStream(stt.SpeechStream):
         self._speaking = False
 
     async def _run(self) -> None:
-        while True:
-            try:
-                channel = grpc.aio.secure_channel(
-                    GRPC_SERVER_URL,
-                    credentials=grpc.ssl_channel_credentials(),
-                )
+        channel = None
+        try:
+            # Create secure channel with SSL credentials
+            channel = grpc.aio.secure_channel(
+                GRPC_SERVER_URL,
+                credentials=grpc.ssl_channel_credentials(),
+            )
 
-                # Import the generated GRPC code
-                from . import vito_stt_client_pb2 as pb
-                from . import vito_stt_client_pb2_grpc as pb_grpc
+            # Import the generated GRPC code
+            from . import vito_stt_client_pb2 as pb
+            from . import vito_stt_client_pb2_grpc as pb_grpc
 
-                stub = pb_grpc.OnlineDecoderStub(channel)
+            stub = pb_grpc.OnlineDecoderStub(channel)
 
-                async def request_iterator():
+            async def request_iterator():
+                try:
                     # First request with config
                     decoder_config = pb.DecoderConfig(
                         sample_rate=self._config.sample_rate,
@@ -274,83 +276,53 @@ class SpeechStream(stt.SpeechStream):
                     # Stream audio data
                     async for frame in self._input_ch:
                         if isinstance(frame, rtc.AudioFrame):
-                            yield pb.DecoderRequest(audio_content=frame.data.tobytes())
-
-                creds = grpc.access_token_call_credentials(self._token_getter())
-                responses = stub.Decode(
-                    request_iterator(),
-                    credentials=grpc.composite_channel_credentials(
-                        grpc.ssl_channel_credentials(), creds
-                    ),
-                )
-
-                async for response in responses:
-                    for result in response.results:
-                        if not result.alternatives:
-                            continue
-
-                        # Detect start of speech if we have alternatives
-                        if not self._speaking and result.alternatives[0].text.strip():
-                            self._speaking = True
-                            self._event_ch.send_nowait(
-                                stt.SpeechEvent(
-                                    type=stt.SpeechEventType.START_OF_SPEECH
+                            try:
+                                yield pb.DecoderRequest(
+                                    audio_content=frame.data.tobytes()
                                 )
-                            )
+                            finally:
+                                # Ensure frame data is cleared
+                                del frame.data
+                                del frame
+                except Exception as e:
+                    logger.error(f"Error in request_iterator: {e}")
+                    raise
 
-                        event_type = (
-                            stt.SpeechEventType.FINAL_TRANSCRIPT
-                            if result.is_final
-                            else stt.SpeechEventType.INTERIM_TRANSCRIPT
-                        )
+            # Create access token credentials
+            cred = grpc.access_token_call_credentials(self._token_getter())
 
-                        alternatives = [
-                            stt.SpeechData(
-                                language=self._config.language,
-                                start_time=result.start_at / 1000,
-                                end_time=(result.start_at + result.duration) / 1000,
-                                confidence=alt.confidence,
-                                text=alt.text,
-                            )
-                            for alt in result.alternatives
-                        ]
+            # Use the credentials directly with the stub call
+            async for response in stub.Decode(request_iterator(), credentials=cred):
+                # Process response immediately
+                if response and response.results:
+                    for result in response.results:
+                        # Process result and clear it
+                        await self._process_result(result)
+                        del result
+                # Clear response after processing
+                del response
 
-                        self._event_ch.send_nowait(
-                            stt.SpeechEvent(
-                                type=event_type,
-                                alternatives=alternatives,
-                            )
-                        )
-
-                        # If this was a final result, mark end of speech
-                        if result.is_final and self._speaking:
-                            self._speaking = False
-                            self._event_ch.send_nowait(
-                                stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH)
-                            )
-
-                if await self._reconnect_event.wait():
-                    self._reconnect_event.clear()
-                    continue
-                break
-
-            except grpc.RpcError as e:
-                if e.code() == grpc.StatusCode.UNAUTHENTICATED:  # Code 16
-                    raise APIStatusError("Authentication failed", status_code=401)
-                elif e.code() == grpc.StatusCode.INVALID_ARGUMENT:  # Code 3
-                    raise APIStatusError("Invalid parameters", status_code=400)
-                elif e.code() == grpc.StatusCode.RESOURCE_EXHAUSTED:  # Code 8
-                    raise APIStatusError(
-                        "Resource exhausted or payment required", status_code=429
-                    )
-                elif e.code() == grpc.StatusCode.INTERNAL:  # Code 13
-                    raise APIStatusError("Internal server error", status_code=500)
-                else:
-                    raise APIConnectionError() from e
-            except Exception as e:
+        except grpc.RpcError as e:
+            if e.code() == grpc.StatusCode.UNAUTHENTICATED:
+                raise APIStatusError("Authentication failed", status_code=401)
+            elif e.code() == grpc.StatusCode.INVALID_ARGUMENT:
+                raise APIStatusError("Invalid parameters", status_code=400)
+            elif e.code() == grpc.StatusCode.RESOURCE_EXHAUSTED:
+                raise APIStatusError(
+                    "Resource exhausted or payment required", status_code=429
+                )
+            elif e.code() == grpc.StatusCode.INTERNAL:
+                raise APIStatusError("Internal server error", status_code=500)
+            else:
                 raise APIConnectionError() from e
-            finally:
-                await channel.close()
+        except Exception as e:
+            raise APIConnectionError() from e
+        finally:
+            if channel:
+                try:
+                    await channel.close()
+                except Exception as e:
+                    logger.error(f"Error closing channel: {e}")
 
     def update_options(
         self,
