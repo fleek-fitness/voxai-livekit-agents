@@ -288,10 +288,9 @@ class SpeechStream(stt.SpeechStream):
 
             async def request_iterator():
                 try:
-                    # Match example's config structure
                     decoder_config = pb.DecoderConfig(
                         sample_rate=self._config.sample_rate,
-                        encoding=pb.DecoderConfig.AudioEncoding.LINEAR16,  # Match example's ENCODING
+                        encoding=pb.DecoderConfig.AudioEncoding.LINEAR16,
                         model_name=self._config.model,
                         use_itn=self._config.use_itn,
                         use_disfluency_filter=self._config.use_disfluency_filter,
@@ -300,30 +299,23 @@ class SpeechStream(stt.SpeechStream):
                     )
                     yield pb.DecoderRequest(streaming_config=decoder_config)
 
-                    # Stream audio data with size limits like example
-                    while not self._closed:
-                        try:
-                            frame = await self._input_ch.get()
-                            if isinstance(frame, rtc.AudioFrame):
-                                try:
-                                    data = frame.data.tobytes()
-                                    # Match example's size limit
-                                    if len(data) > 1024 * 1024:
-                                        data = data[: 1024 * 1024]
-                                    yield pb.DecoderRequest(audio_content=data)
-                                finally:
-                                    del frame.data
-                                    del frame
-                        except asyncio.CancelledError:
-                            break
+                    # Use async iteration instead of get()
+                    async for frame in self._input_ch:
+                        if isinstance(frame, rtc.AudioFrame):
+                            try:
+                                data = frame.data.tobytes()
+                                if len(data) > 1024 * 1024:
+                                    data = data[: 1024 * 1024]
+                                yield pb.DecoderRequest(audio_content=data)
+                            finally:
+                                del frame.data
+                                del frame
                 except Exception as e:
                     logger.error(f"Error in request_iterator: {e}")
                     raise
 
-            # Create credentials exactly like example
             cred = grpc.access_token_call_credentials(self._token_getter())
 
-            # Process responses like example
             async for response in stub.Decode(request_iterator(), credentials=cred):
                 if response and response.results:
                     for result in response.results:
