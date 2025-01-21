@@ -6,7 +6,7 @@ import os
 import time
 import weakref
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import grpc
 import requests
@@ -56,17 +56,6 @@ class STT(stt.STT):
     ) -> None:
         """
         Create a new instance of RTZR STT.
-
-        Args:
-            model: The RTZR model to use
-            language: The language code (e.g., "ko-KR")
-            sample_rate: Audio sample rate in Hz
-            use_itn: Enable inverse text normalization
-            use_disfluency_filter: Enable disfluency filter
-            use_profanity_filter: Enable profanity filter
-            keywords: List of keyword tuples (word, boost)
-            client_id: RTZR client ID
-            client_secret: RTZR client secret
         """
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -75,7 +64,7 @@ class STT(stt.STT):
             )
         )
 
-        # Validate model and language
+        # Validate model/language
         if not isinstance(model, (str, RTZRModels)):
             raise ValueError(f"Invalid model type: {type(model)}")
         if not isinstance(language, (str, RTZRLanguages)):
@@ -83,24 +72,22 @@ class STT(stt.STT):
 
         # Validate sample rate
         if sample_rate not in [8000, 16000]:
-            raise ValueError("Sample rate must be either 8000 or 16000 Hz")
+            raise ValueError("Sample rate must be 8000 or 16000 Hz")
 
         client_id = client_id or os.environ.get("RTZR_CLIENT_ID")
         client_secret = client_secret or os.environ.get("RTZR_CLIENT_SECRET")
-
         if not client_id or not client_secret:
             raise ValueError(
-                "RTZR credentials must be provided either through arguments or "
-                "RTZR_CLIENT_ID and RTZR_CLIENT_SECRET environment variables"
+                "Must provide RTZR credentials (args or RTZR_CLIENT_ID/RTZR_CLIENT_SECRET env)."
             )
 
         self._client_id = client_id
         self._client_secret = client_secret
+        self._session = requests.Session()
         self._token = None
         self._token_expire = 0
-        self._session = requests.Session()
-        self._streams = weakref.WeakSet[SpeechStream]()
 
+        self._streams = weakref.WeakSet[SpeechStream]()
         self._config = STTOptions(
             language=language,
             model=model,
@@ -113,8 +100,9 @@ class STT(stt.STT):
         )
 
     def _get_token(self) -> str:
-        """Get or refresh the authentication token."""
+        """Get or refresh the auth token."""
         try:
+            # if no token or expired => fetch
             if not self._token or time.time() >= self._token_expire:
                 resp = self._session.post(
                     f"{API_BASE}/v1/authenticate",
@@ -122,7 +110,7 @@ class STT(stt.STT):
                         "client_id": self._client_id,
                         "client_secret": self._client_secret,
                     },
-                    timeout=10,  # Add timeout
+                    timeout=10,
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -130,7 +118,7 @@ class STT(stt.STT):
                 self._token_expire = data["expire_at"]
             return self._token
         except requests.exceptions.RequestException as e:
-            raise APIConnectionError("Failed to get authentication token") from e
+            raise APIConnectionError("Failed to fetch RTZR token") from e
 
     def stream(
         self,
@@ -177,7 +165,7 @@ class STT(stt.STT):
         if keywords is not None:
             self._config.keywords = keywords
 
-        # Update existing streams
+        # Also update existing streams
         for stream in self._streams:
             stream.update_options(
                 language=language,
@@ -189,18 +177,14 @@ class STT(stt.STT):
             )
 
     async def _recognize_impl(
-        self, audio_data: bytes, language: str | None = None
+        self,
+        audio_data: bytes,
+        language: str | None = None,
     ) -> List[stt.SpeechData]:
-        """
-        Implements the abstract method for non-streaming recognition.
-        This is required by the base STT class but RTZR primarily supports streaming.
-        """
-        raise NotImplementedError(
-            "RTZR STT only supports streaming recognition. Use stream() instead."
-        )
+        # Non-streaming recognition is not implemented
+        raise NotImplementedError("RTZR plugin supports streaming only.")
 
     async def close(self):
-        """Close the STT instance and all active streams."""
         for stream in list(self._streams):
             await stream.close()
         self._session.close()
@@ -208,36 +192,26 @@ class STT(stt.STT):
 
 
 def _validate_keywords(keywords: List[Tuple[str, float]]) -> List[str]:
-    """Validate and format keywords according to RTZR specifications."""
-    formatted_keywords = []
-    for word, score in keywords:
-        # Validate word format (Korean syllables and spaces only, as an example)
+    """Convert (word, weight) -> 'word:weight' and do basic checks."""
+    formatted = []
+    for word, boost in keywords:
+        # Example validation: only allow Korean & spaces. Adjust as needed
         if not all(c.isspace() or (0xAC00 <= ord(c) <= 0xD7A3) for c in word):
-            raise ValueError(
-                f"Keyword '{word}' must contain only Korean syllables and spaces"
-            )
-
-        # Check word length
+            raise ValueError(f"Keyword '{word}' must contain only Korean text/spaces")
         if len(word) > 20:
-            raise ValueError(
-                f"Keyword '{word}' exceeds maximum length of 20 characters"
-            )
+            raise ValueError(f"Keyword '{word}' is too long (max 20 chars)")
 
-        # Validate score range
-        if score is not None and not (-5.0 <= score <= 5.0):
-            raise ValueError(f"Score for keyword '{word}' must be between -5.0 and 5.0")
-
-        # Format keyword string for gRPC request
-        if score is None:
-            formatted_keywords.append(word)  # Will use default score of 2.0
+        if boost is None:
+            formatted.append(word)
         else:
-            formatted_keywords.append(f"{word}:{score}")
+            if not (-5.0 <= boost <= 5.0):
+                raise ValueError("Keyword boost must be between -5.0 and 5.0")
+            formatted.append(f"{word}:{boost}")
 
-    # Check total keywords limit
-    if len(formatted_keywords) > 100:
-        raise ValueError("Maximum number of keywords (100) exceeded")
+    if len(formatted) > 100:
+        raise ValueError("Too many keywords (max 100)")
 
-    return formatted_keywords
+    return formatted
 
 
 class SpeechStream(stt.SpeechStream):
@@ -250,14 +224,11 @@ class SpeechStream(stt.SpeechStream):
         token_getter: callable,
     ) -> None:
         super().__init__(
-            stt=stt,
-            conn_options=conn_options,
-            sample_rate=config.sample_rate,
+            stt=stt, conn_options=conn_options, sample_rate=config.sample_rate
         )
         self._config = config
         self._token_getter = token_getter
         self._closed = False
-        self._bytes_per_sample = 2
 
     def update_options(
         self,
@@ -282,44 +253,37 @@ class SpeechStream(stt.SpeechStream):
         if keywords is not None:
             self._config.keywords = keywords
 
-        self._closed = False
-
     def push_frame(self, frame: rtc.AudioFrame) -> None:
-        """Override push_frame to check closed state."""
         if self._closed:
-            logger.warning("Attempting to push frame to a closed stream.")
+            logger.warning("Trying to push_frame on a closed RTZR stream.")
             return
         super().push_frame(frame)
 
     async def close(self):
-        """Properly close the stream."""
-        if not self._closed:
-            self._closed = True
-            try:
-                if self._input_ch:
-                    await self._input_ch.close()
-                # Wait for any pending tasks to complete
-                await asyncio.sleep(0)
-            finally:
-                await super().close()
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._input_ch:
+                await self._input_ch.close()
+            await asyncio.sleep(0)  # let tasks drain
+        finally:
+            await super().close()
 
     async def _run(self) -> None:
         channel = None
         try:
+            # secure gRPC channel
             channel = grpc.aio.secure_channel(
-                GRPC_SERVER_URL, grpc.ssl_channel_credentials()
+                GRPC_SERVER_URL,
+                credentials=grpc.ssl_channel_credentials(),
             )
-
-            # Import your generated stubs
             from . import vito_stt_client_pb2 as pb
             from . import vito_stt_client_pb2_grpc as pb_grpc
 
             stub = pb_grpc.OnlineDecoderStub(channel)
 
             async def request_iterator():
-                """
-                Asynchronously yield `DecoderRequest` messages for the gRPC call.
-                """
                 try:
                     decoder_config = pb.DecoderConfig(
                         sample_rate=self._config.sample_rate,
@@ -330,14 +294,13 @@ class SpeechStream(stt.SpeechStream):
                         use_profanity_filter=self._config.use_profanity_filter,
                         keywords=_validate_keywords(self._config.keywords),
                     )
-                    # First message must contain the streaming config
+                    # first message => streaming config
                     yield pb.DecoderRequest(streaming_config=decoder_config)
 
-                    # Subsequent messages carry raw audio frames
                     async for frame in self._input_ch:
                         if isinstance(frame, rtc.AudioFrame):
                             data = frame.data.tobytes()
-                            # Safety limit if you want to avoid huge frames
+                            # optional limit
                             if len(data) > 1024 * 1024:
                                 data = data[: 1024 * 1024]
                             yield pb.DecoderRequest(audio_content=data)
@@ -345,54 +308,53 @@ class SpeechStream(stt.SpeechStream):
                     logger.error(f"Error in request_iterator: {e}")
                     raise
 
-            # Attach access token credentials for the call
+            # attach credentials
             cred = grpc.access_token_call_credentials(self._token_getter())
 
-            # Make the streaming gRPC call
             async for response in stub.Decode(request_iterator(), credentials=cred):
-                # Each response can contain multiple results
-                if response and response.results:
-                    for result in response.results:
-                        if not result.alternatives:
-                            continue
+                if not response or not response.results:
+                    continue
 
-                        alt = result.alternatives[0]
-                        if not alt.text:
-                            continue
+                # Process each result
+                for result in response.results:
+                    # If no alt => skip
+                    if not result.alternatives:
+                        continue
 
-                        # Mark transcript type: interim or final
-                        if result.is_final:
-                            event_type = stt.SpeechEventType.FINAL_TRANSCRIPT
-                        else:
-                            event_type = stt.SpeechEventType.INTERIM_TRANSCRIPT
+                    alt = result.alternatives[0]
+                    if not alt.text:
+                        continue
 
-                        # Convert RTZR result to the SpeechData structure
-                        speech_data = stt.SpeechData(
-                            language=self._config.language,
-                            start_time=0.0,  # RTZR doesn't provide start/end times
-                            end_time=0.0,
-                            confidence=alt.confidence if alt.confidence else 1.0,
-                            text=alt.text,
+                    # RTZR sets is_final => final vs partial transcript
+                    if result.is_final:
+                        event_type = stt.SpeechEventType.FINAL_TRANSCRIPT
+                    else:
+                        event_type = stt.SpeechEventType.INTERIM_TRANSCRIPT
+
+                    speech_data = stt.SpeechData(
+                        language=self._config.language,
+                        start_time=0.0,  # RTZR doesn't return word timestamps
+                        end_time=0.0,
+                        confidence=alt.confidence if alt.confidence else 1.0,
+                        text=alt.text,
+                    )
+
+                    # Instead of self._emit(...), we do:
+                    self._event_ch.send_nowait(
+                        stt.SpeechEvent(
+                            type=event_type,
+                            alternatives=[speech_data],
                         )
-
-                        # Emit the partial (interim) or final transcript
-                        await self._emit(
-                            stt.SpeechEvent(
-                                type=event_type,
-                                alternatives=[speech_data],
-                            )
-                        )
+                    )
 
         except grpc.RpcError as e:
-            # Handle common gRPC errors in a manner similar to Google STT
+            # Similar to google/deepgram error handling
             if e.code() == grpc.StatusCode.UNAUTHENTICATED:
                 raise APIStatusError("Authentication failed", status_code=401)
             elif e.code() == grpc.StatusCode.INVALID_ARGUMENT:
                 raise APIStatusError("Invalid parameters", status_code=400)
             elif e.code() == grpc.StatusCode.RESOURCE_EXHAUSTED:
-                raise APIStatusError(
-                    "Resource exhausted or payment required", status_code=429
-                )
+                raise APIStatusError("Resource exhausted / Over quota", status_code=429)
             elif e.code() == grpc.StatusCode.INTERNAL:
                 raise APIStatusError("Internal server error", status_code=500)
             else:
@@ -406,4 +368,4 @@ class SpeechStream(stt.SpeechStream):
                 try:
                     await channel.close()
                 except Exception as e:
-                    logger.error(f"Error closing gRPC channel: {e}")
+                    logger.error(f"Error closing RTZR gRPC channel: {e}")
