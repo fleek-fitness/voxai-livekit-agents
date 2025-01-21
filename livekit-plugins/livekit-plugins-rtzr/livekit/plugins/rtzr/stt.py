@@ -270,20 +270,17 @@ class SpeechStream(stt.SpeechStream):
         )
         self._config = config
         self._token_getter = token_getter
-        self._reconnect_event = asyncio.Event()
-        self._speaking = False
         self._closed = False
+        self._bytes_per_sample = 2  # Match example's BYTES_PER_SAMPLE
 
     async def _run(self) -> None:
         channel = None
         try:
-            # Create secure channel with SSL credentials
             channel = grpc.aio.secure_channel(
                 GRPC_SERVER_URL,
                 credentials=grpc.ssl_channel_credentials(),
             )
 
-            # Import the generated GRPC code
             from . import vito_stt_client_pb2 as pb
             from . import vito_stt_client_pb2_grpc as pb_grpc
 
@@ -291,9 +288,10 @@ class SpeechStream(stt.SpeechStream):
 
             async def request_iterator():
                 try:
+                    # Match example's config structure
                     decoder_config = pb.DecoderConfig(
                         sample_rate=self._config.sample_rate,
-                        encoding=pb.DecoderConfig.AudioEncoding.LINEAR16,
+                        encoding=pb.DecoderConfig.AudioEncoding.LINEAR16,  # Match example's ENCODING
                         model_name=self._config.model,
                         use_itn=self._config.use_itn,
                         use_disfluency_filter=self._config.use_disfluency_filter,
@@ -302,14 +300,17 @@ class SpeechStream(stt.SpeechStream):
                     )
                     yield pb.DecoderRequest(streaming_config=decoder_config)
 
+                    # Stream audio data with size limits like example
                     while not self._closed:
                         try:
                             frame = await self._input_ch.get()
                             if isinstance(frame, rtc.AudioFrame):
                                 try:
-                                    yield pb.DecoderRequest(
-                                        audio_content=frame.data.tobytes()
-                                    )
+                                    data = frame.data.tobytes()
+                                    # Match example's size limit
+                                    if len(data) > 1024 * 1024:
+                                        data = data[: 1024 * 1024]
+                                    yield pb.DecoderRequest(audio_content=data)
                                 finally:
                                     del frame.data
                                     del frame
@@ -319,18 +320,15 @@ class SpeechStream(stt.SpeechStream):
                     logger.error(f"Error in request_iterator: {e}")
                     raise
 
-            # Create access token credentials
+            # Create credentials exactly like example
             cred = grpc.access_token_call_credentials(self._token_getter())
 
-            # Use the credentials directly with the stub call
+            # Process responses like example
             async for response in stub.Decode(request_iterator(), credentials=cred):
-                # Process response immediately
                 if response and response.results:
                     for result in response.results:
-                        # Process result and clear it
                         await self._process_result(result)
                         del result
-                # Clear response after processing
                 del response
 
         except grpc.RpcError as e:
@@ -349,7 +347,6 @@ class SpeechStream(stt.SpeechStream):
         except Exception as e:
             raise APIConnectionError() from e
         finally:
-            self._closed = True
             if channel:
                 try:
                     await channel.close()
@@ -379,7 +376,7 @@ class SpeechStream(stt.SpeechStream):
         if keywords is not None:
             self._config.keywords = keywords
 
-        self._reconnect_event.set()
+        self._closed = False
 
     async def close(self):
         """Properly close the stream."""
