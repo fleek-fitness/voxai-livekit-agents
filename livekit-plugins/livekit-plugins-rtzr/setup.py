@@ -32,8 +32,8 @@ setuptools.setup(
     python_requires=">=3.9.0",
     install_requires=[
         "livekit-agents>=0.12.3",
-        "grpcio==1.67.1",
-        "grpcio-tools==1.67.1",
+        "grpcio>=1.69.0",
+        "grpcio-tools>=1.69.0",
         "requests>=2.31.0",
         "protobuf>=4.24.0",
         "pydub>=0.25.1",
