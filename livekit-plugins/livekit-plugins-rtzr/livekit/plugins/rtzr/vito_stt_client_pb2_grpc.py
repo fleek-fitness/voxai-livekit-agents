@@ -3,31 +3,33 @@
 import grpc
 import warnings
 
-import vito_stt_client_pb2 as vito__stt__client__pb2
+from . import vito_stt_client_pb2 as vito__stt__client__pb2
 
-GRPC_GENERATED_VERSION = '1.67.1'
+GRPC_GENERATED_VERSION = "1.67.1"
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
 try:
     from grpc._utilities import first_version_is_lower
-    _version_not_supported = first_version_is_lower(GRPC_VERSION, GRPC_GENERATED_VERSION)
+
+    _version_not_supported = first_version_is_lower(
+        GRPC_VERSION, GRPC_GENERATED_VERSION
+    )
 except ImportError:
     _version_not_supported = True
 
 if _version_not_supported:
     raise RuntimeError(
-        f'The grpc package installed is at version {GRPC_VERSION},'
-        + f' but the generated code in vito_stt_client_pb2_grpc.py depends on'
-        + f' grpcio>={GRPC_GENERATED_VERSION}.'
-        + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
-        + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
+        f"The grpc package installed is at version {GRPC_VERSION},"
+        + f" but the generated code in vito_stt_client_pb2_grpc.py depends on"
+        + f" grpcio>={GRPC_GENERATED_VERSION}."
+        + f" Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}"
+        + f" or downgrade your generated code using grpcio-tools<={GRPC_VERSION}."
     )
 
 
 class OnlineDecoderStub(object):
-    """The greeting service definition.
-    """
+    """The greeting service definition."""
 
     def __init__(self, channel):
         """Constructor.
@@ -36,58 +38,61 @@ class OnlineDecoderStub(object):
             channel: A grpc.Channel.
         """
         self.Decode = channel.stream_stream(
-                '/online_decoder.OnlineDecoder/Decode',
-                request_serializer=vito__stt__client__pb2.DecoderRequest.SerializeToString,
-                response_deserializer=vito__stt__client__pb2.DecoderResponse.FromString,
-                _registered_method=True)
+            "/online_decoder.OnlineDecoder/Decode",
+            request_serializer=vito__stt__client__pb2.DecoderRequest.SerializeToString,
+            response_deserializer=vito__stt__client__pb2.DecoderResponse.FromString,
+            _registered_method=True,
+        )
 
 
 class OnlineDecoderServicer(object):
-    """The greeting service definition.
-    """
+    """The greeting service definition."""
 
     def Decode(self, request_iterator, context):
-        """Sends multiple greetings
-        """
+        """Sends multiple greetings"""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
+        context.set_details("Method not implemented!")
+        raise NotImplementedError("Method not implemented!")
 
 
 def add_OnlineDecoderServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'Decode': grpc.stream_stream_rpc_method_handler(
-                    servicer.Decode,
-                    request_deserializer=vito__stt__client__pb2.DecoderRequest.FromString,
-                    response_serializer=vito__stt__client__pb2.DecoderResponse.SerializeToString,
-            ),
+        "Decode": grpc.stream_stream_rpc_method_handler(
+            servicer.Decode,
+            request_deserializer=vito__stt__client__pb2.DecoderRequest.FromString,
+            response_serializer=vito__stt__client__pb2.DecoderResponse.SerializeToString,
+        ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'online_decoder.OnlineDecoder', rpc_method_handlers)
+        "online_decoder.OnlineDecoder", rpc_method_handlers
+    )
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('online_decoder.OnlineDecoder', rpc_method_handlers)
+    server.add_registered_method_handlers(
+        "online_decoder.OnlineDecoder", rpc_method_handlers
+    )
 
 
- # This class is part of an EXPERIMENTAL API.
+# This class is part of an EXPERIMENTAL API.
 class OnlineDecoder(object):
-    """The greeting service definition.
-    """
+    """The greeting service definition."""
 
     @staticmethod
-    def Decode(request_iterator,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
+    def Decode(
+        request_iterator,
+        target,
+        options=(),
+        channel_credentials=None,
+        call_credentials=None,
+        insecure=False,
+        compression=None,
+        wait_for_ready=None,
+        timeout=None,
+        metadata=None,
+    ):
         return grpc.experimental.stream_stream(
             request_iterator,
             target,
-            '/online_decoder.OnlineDecoder/Decode',
+            "/online_decoder.OnlineDecoder/Decode",
             vito__stt__client__pb2.DecoderRequest.SerializeToString,
             vito__stt__client__pb2.DecoderResponse.FromString,
             options,
@@ -98,4 +103,5 @@ class OnlineDecoder(object):
             wait_for_ready,
             timeout,
             metadata,
-            _registered_method=True)
+            _registered_method=True,
+        )
