@@ -179,6 +179,18 @@ class STT(stt.STT):
                 keywords=keywords,
             )
 
+    async def _recognize_impl(
+        self, audio_data: bytes, language: str | None = None
+    ) -> List[stt.SpeechData]:
+        """
+        Implements the abstract method for non-streaming recognition.
+        This is required by the base STT class but RTZR primarily supports streaming.
+        """
+        raise NotImplementedError(
+            "RTZR STT only supports streaming recognition. "
+            "Use stream() method instead."
+        )
+
 
 def _validate_keywords(keywords: List[Tuple[str, float]]) -> List[str]:
     """Validate and format keywords according to RTZR specifications."""
