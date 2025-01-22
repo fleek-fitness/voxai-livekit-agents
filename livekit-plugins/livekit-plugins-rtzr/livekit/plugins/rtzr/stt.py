@@ -305,7 +305,7 @@ class SpeechStream(stt.SpeechStream):
 
             stub = pb_grpc.OnlineDecoderStub(channel)
 
-            DEFAULT_BUFFER_SIZE = 8 * 1024  # 8KB buffer
+            DEFAULT_BUFFER_SIZE = 4 * 1024  # 4KB buffer
 
             async def request_iterator():
                 try:
