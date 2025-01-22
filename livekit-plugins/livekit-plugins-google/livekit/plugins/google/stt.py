@@ -33,11 +33,12 @@ from livekit.agents import (
 )
 
 from google.api_core.client_options import ClientOptions
-from google.api_core.exceptions import DeadlineExceeded, GoogleAPICallError
+from google.api_core.exceptions import DeadlineExceeded, GoogleAPICallError, NotFound
 from google.auth import default as gauth_default
 from google.auth.exceptions import DefaultCredentialsError
 from google.cloud.speech_v2 import SpeechAsyncClient
 from google.cloud.speech_v2.types import cloud_speech
+from google.protobuf import field_mask_pb2 as field_mask
 
 from .log import logger
 from .models import SpeechLanguages, SpeechModels
@@ -85,7 +86,7 @@ class STT(stt.STT):
     def __init__(
         self,
         *,
-        languages: LanguageCode = "en-US",  # Google STT can accept multiple languages
+        languages: LanguageCode = "en-US",
         detect_language: bool = True,
         interim_results: bool = True,
         punctuate: bool = True,
@@ -96,6 +97,7 @@ class STT(stt.STT):
         credentials_info: dict | None = None,
         credentials_file: str | None = None,
         keywords: List[tuple[str, float]] | None = None,
+        recognizer_id: str | None = None,
     ):
         """
         Create a new instance of Google STT.
@@ -112,6 +114,8 @@ class STT(stt.STT):
         self._location = location
         self._credentials_info = credentials_info
         self._credentials_file = credentials_file
+        self._recognizer_id = recognizer_id
+        self._recognizer_created = False
 
         if credentials_file is None and credentials_info is None:
             try:
@@ -160,19 +164,50 @@ class STT(stt.STT):
         assert self._client is not None
         return self._client
 
+    async def _ensure_recognizer(self) -> None:
+        """Ensures the recognizer exists, creating it if necessary.
+        Only runs once per STT instance to avoid unnecessary API calls."""
+        if not self._recognizer_id or self._recognizer_created:
+            return
+
+        client = self._ensure_client()
+        try:
+            await client.get_recognizer(name=self._recognizer)
+            self._recognizer_created = True
+            logger.debug(f"Using existing recognizer: {self._recognizer_id}")
+        except NotFound:
+            logger.info(f"Creating new recognizer: {self._recognizer_id}")
+            request = cloud_speech.CreateRecognizerRequest(
+                parent=f"projects/{self._project_id}/locations/{self._location}",
+                recognizer_id=self._recognizer_id,
+                recognizer=cloud_speech.Recognizer(
+                    default_recognition_config=cloud_speech.RecognitionConfig(
+                        language_codes=self._config.languages,
+                        model=self._config.model,
+                        features=cloud_speech.RecognitionFeatures(
+                            enable_automatic_punctuation=self._config.punctuate,
+                            enable_spoken_punctuation=self._config.spoken_punctuation,
+                            enable_word_time_offsets=True,
+                        ),
+                        adaptation=self._config.build_adaptation(),
+                    ),
+                ),
+            )
+            operation = await client.create_recognizer(request=request)
+            await operation.result()
+            self._recognizer_created = True
+
     @property
     def _recognizer(self) -> str:
-        # TODO(theomonnom): should we use recognizers?
-        # recognizers may improve latency https://cloud.google.com/speech-to-text/v2/docs/recognizers#understand_recognizers
-
-        # TODO(theomonnom): find a better way to access the project_id
         try:
             project_id = self._ensure_client().transport._credentials.project_id  # type: ignore
         except AttributeError:
             from google.auth import default as ga_default
 
             _, project_id = ga_default()
-        return f"projects/{project_id}/locations/{self._location}/recognizers/_"
+
+        base = f"projects/{project_id}/locations/{self._location}/recognizers"
+        return f"{base}/{self._recognizer_id}" if self._recognizer_id else f"{base}/_"
 
     def _sanitize_options(self, *, language: str | None = None) -> STTOptions:
         config = dataclasses.replace(self._config)
@@ -198,35 +233,73 @@ class STT(stt.STT):
         language: SpeechLanguages | str | None,
         conn_options: APIConnectOptions,
     ) -> stt.SpeechEvent:
+        await self._ensure_recognizer()
         config = self._sanitize_options(language=language)
         frame = rtc.combine_audio_frames(buffer)
 
-        config = cloud_speech.RecognitionConfig(
-            explicit_decoding_config=cloud_speech.ExplicitDecodingConfig(
+        # Only specify fields that differ from recognizer defaults
+        override_config = {}
+        config_mask_paths = []
+
+        # Always specify audio config as it's per-request
+        override_config["explicit_decoding_config"] = (
+            cloud_speech.ExplicitDecodingConfig(
                 encoding=cloud_speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
                 sample_rate_hertz=frame.sample_rate,
                 audio_channel_count=frame.num_channels,
-            ),
-            adaptation=config.build_adaptation(),
-            features=cloud_speech.RecognitionFeatures(
+            )
+        )
+        config_mask_paths.append("explicit_decoding_config")
+
+        # Only add other fields if they differ from defaults or we're using ephemeral recognizer
+        if (
+            not self._recognizer_id
+            or language
+            or config.languages != self._config.languages
+        ):
+            override_config["language_codes"] = config.languages
+            config_mask_paths.append("language_codes")
+
+        if not self._recognizer_id or config.model != self._config.model:
+            override_config["model"] = config.model
+            config_mask_paths.append("model")
+
+        if (
+            not self._recognizer_id
+            or config.punctuate != self._config.punctuate
+            or config.spoken_punctuation != self._config.spoken_punctuation
+        ):
+            override_config["features"] = cloud_speech.RecognitionFeatures(
                 enable_automatic_punctuation=config.punctuate,
                 enable_spoken_punctuation=config.spoken_punctuation,
                 enable_word_time_offsets=True,
-            ),
-            model=config.model,
-            language_codes=config.languages,
-        )
+            )
+            config_mask_paths.append("features")
+
+        if not self._recognizer_id or config.keywords != self._config.keywords:
+            adaptation = config.build_adaptation()
+            if adaptation:
+                override_config["adaptation"] = adaptation
+                config_mask_paths.append("adaptation")
 
         try:
             raw = await self._ensure_client().recognize(
                 cloud_speech.RecognizeRequest(
                     recognizer=self._recognizer,
-                    config=config,
+                    config=(
+                        cloud_speech.RecognitionConfig(**override_config)
+                        if override_config
+                        else None
+                    ),
+                    config_mask=(
+                        field_mask.FieldMask(paths=config_mask_paths)
+                        if config_mask_paths and self._recognizer_id
+                        else None
+                    ),
                     content=frame.data.tobytes(),
                 ),
                 timeout=conn_options.timeout,
             )
-
             return _recognize_response_to_speech_event(raw)
         except DeadlineExceeded:
             raise APITimeoutError()
@@ -452,20 +525,51 @@ class SpeechStream(stt.SpeechStream):
 
         while True:
             try:
+                # Build streaming config with masks for named recognizers
+                override_config = {}
+                config_mask_paths = []
+
+                # Always specify audio config
+                override_config["explicit_decoding_config"] = (
+                    cloud_speech.ExplicitDecodingConfig(
+                        encoding=cloud_speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
+                        sample_rate_hertz=self._config.sample_rate,
+                        audio_channel_count=1,
+                    )
+                )
+                config_mask_paths.append("explicit_decoding_config")
+
+                # Add other fields if using ephemeral recognizer or if they differ from defaults
+                if not isinstance(self._stt, STT) or not self._stt._recognizer_id:
+                    override_config.update(
+                        {
+                            "language_codes": self._config.languages,
+                            "model": self._config.model,
+                            "features": cloud_speech.RecognitionFeatures(
+                                enable_automatic_punctuation=self._config.punctuate,
+                                enable_word_time_offsets=True,
+                            ),
+                        }
+                    )
+                    config_mask_paths.extend(["language_codes", "model", "features"])
+
+                    adaptation = self._config.build_adaptation()
+                    if adaptation:
+                        override_config["adaptation"] = adaptation
+                        config_mask_paths.append("adaptation")
+
                 self._streaming_config = cloud_speech.StreamingRecognitionConfig(
-                    config=cloud_speech.RecognitionConfig(
-                        explicit_decoding_config=cloud_speech.ExplicitDecodingConfig(
-                            encoding=cloud_speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
-                            sample_rate_hertz=self._config.sample_rate,
-                            audio_channel_count=1,
-                        ),
-                        adaptation=self._config.build_adaptation(),
-                        language_codes=self._config.languages,
-                        model=self._config.model,
-                        features=cloud_speech.RecognitionFeatures(
-                            enable_automatic_punctuation=self._config.punctuate,
-                            enable_word_time_offsets=True,
-                        ),
+                    config=(
+                        cloud_speech.RecognitionConfig(**override_config)
+                        if override_config
+                        else None
+                    ),
+                    config_mask=(
+                        field_mask.FieldMask(paths=config_mask_paths)
+                        if config_mask_paths
+                        and isinstance(self._stt, STT)
+                        and self._stt._recognizer_id
+                        else None
                     ),
                     streaming_features=cloud_speech.StreamingRecognitionFeatures(
                         enable_voice_activity_events=True,
