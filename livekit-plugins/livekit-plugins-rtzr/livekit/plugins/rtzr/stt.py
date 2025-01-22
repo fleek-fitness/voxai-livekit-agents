@@ -293,11 +293,22 @@ class SpeechStream(stt.SpeechStream):
             await super().close()
 
     async def _run(self) -> None:
+        channel = None
         try:
+            # secure gRPC channel
+            channel = grpc.aio.secure_channel(
+                GRPC_SERVER_URL,
+                credentials=grpc.ssl_channel_credentials(),
+            )
+            from . import vito_stt_client_pb2 as pb
+            from . import vito_stt_client_pb2_grpc as pb_grpc
+
+            stub = pb_grpc.OnlineDecoderStub(channel)
+
+            DEFAULT_BUFFER_SIZE = 8 * 1024  # 8KB buffer
 
             async def request_iterator():
                 try:
-                    # Send initial config
                     decoder_config = pb.DecoderConfig(
                         sample_rate=self._config.sample_rate,
                         encoding=pb.DecoderConfig.AudioEncoding.LINEAR16,
@@ -307,18 +318,27 @@ class SpeechStream(stt.SpeechStream):
                         use_profanity_filter=self._config.use_profanity_filter,
                         keywords=_validate_keywords(self._config.keywords),
                     )
+                    # first message => streaming config
                     yield pb.DecoderRequest(streaming_config=decoder_config)
 
-                    # Stream audio frames immediately without buffering
+                    buffer = bytearray()
                     async for frame in self._input_ch:
                         if isinstance(frame, rtc.AudioFrame):
                             try:
-                                # Send frame data directly without size limit
-                                yield pb.DecoderRequest(
-                                    audio_content=frame.data.tobytes()
-                                )
+                                data = frame.data.tobytes()
+                                buffer.extend(data)
+
+                                # Send when buffer reaches threshold
+                                if len(buffer) >= DEFAULT_BUFFER_SIZE:
+                                    yield pb.DecoderRequest(audio_content=bytes(buffer))
+                                    buffer.clear()
                             finally:
                                 frame = None
+
+                    # Send any remaining data in buffer
+                    if buffer:
+                        yield pb.DecoderRequest(audio_content=bytes(buffer))
+
                 except Exception as e:
                     logger.error(f"Error in request_iterator: {e}")
                     raise
