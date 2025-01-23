@@ -172,6 +172,9 @@ class ClovaSpeechStream(stt.SpeechStream):
         self._closed = False
         self._buffer = bytearray()
         self._seq_id = 0
+        # Add accumulated text buffer
+        self._current_text = ""
+        self._speech_start_time = None
 
     def update_options(
         self,
@@ -300,7 +303,7 @@ class ClovaSpeechStream(stt.SpeechStream):
                     # Handle config response
                     if "config" in j:
                         logger.debug(f"Received config response: {j}")
-                        continue  # Skip sending event for config responses
+                        continue
 
                     # Handle transcription response
                     if "transcription" in j:
@@ -310,39 +313,56 @@ class ClovaSpeechStream(stt.SpeechStream):
                         is_final = ep_flag
 
                         if text:
-                            event_type = (
-                                stt.SpeechEventType.FINAL_TRANSCRIPT
-                                if is_final
-                                else stt.SpeechEventType.INTERIM_TRANSCRIPT
-                            )
-                            speech_data = stt.SpeechData(
-                                text=text,
-                                language=self._config.language,
-                                confidence=1.0,
-                                start_time=time.time(),  # Add timestamps
-                                end_time=time.time(),
-                            )
-                            event = stt.SpeechEvent(
-                                type=event_type,
-                                alternatives=[speech_data],
-                            )
-                            self._event_ch.send_nowait(event)
-                    else:
-                        # Handle raw text response
-                        text = raw_contents
-                        if text:
-                            speech_data = stt.SpeechData(
-                                text=text,
-                                language=self._config.language,
-                                confidence=1.0,
-                                start_time=time.time(),  # Add timestamps
-                                end_time=time.time(),
-                            )
-                            event = stt.SpeechEvent(
-                                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                                alternatives=[speech_data],
-                            )
-                            self._event_ch.send_nowait(event)
+                            # Track speech start time
+                            if self._speech_start_time is None:
+                                self._speech_start_time = time.time()
+                                self._event_ch.send_nowait(
+                                    stt.SpeechEvent(
+                                        type=stt.SpeechEventType.START_OF_SPEECH
+                                    )
+                                )
+
+                            # Accumulate text for interim results
+                            if not is_final:
+                                self._current_text += text
+                                speech_data = stt.SpeechData(
+                                    text=self._current_text,  # Send full accumulated text
+                                    language=self._config.language,
+                                    confidence=1.0,
+                                    start_time=self._speech_start_time,
+                                    end_time=time.time(),
+                                )
+                                event = stt.SpeechEvent(
+                                    type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                                    alternatives=[speech_data],
+                                )
+                                self._event_ch.send_nowait(event)
+                            else:
+                                # For final results, send the complete text and reset
+                                speech_data = stt.SpeechData(
+                                    text=self._current_text + text,
+                                    language=self._config.language,
+                                    confidence=1.0,
+                                    start_time=self._speech_start_time,
+                                    end_time=time.time(),
+                                )
+                                event = stt.SpeechEvent(
+                                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                                    alternatives=[speech_data],
+                                )
+                                self._event_ch.send_nowait(event)
+
+                                # Send end of speech event
+                                self._event_ch.send_nowait(
+                                    stt.SpeechEvent(
+                                        type=stt.SpeechEventType.END_OF_SPEECH
+                                    )
+                                )
+
+                                # Reset for next utterance
+                                self._current_text = ""
+                                self._speech_start_time = None
+
                 except ValueError as e:
                     logger.error(f"Failed to parse response: {e}")
 
