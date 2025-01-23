@@ -194,8 +194,17 @@ class ClovaSpeechStream(stt.SpeechStream):
 
         # Example: if the incoming frame has the wrong sample rate, convert it.
         # (Real code would do actual resampling or rely on upstream logic.)
-        if frame.sample_rate != 16000 or frame.channels != 1 or frame.sample_width != 2:
-            frame = frame.convert(sample_rate=16000, sample_width=2, channels=1)
+        if (
+            frame.sample_rate != CLOVA_SAMPLE_RATE
+            or frame.num_channels
+            != CLOVA_CHANNELS  # Changed from channels to num_channels
+            or frame.sample_width != CLOVA_BITS_PER_SAMPLE // 8
+        ):
+            frame = frame.convert(
+                sample_rate=CLOVA_SAMPLE_RATE,
+                sample_width=CLOVA_BITS_PER_SAMPLE // 8,
+                channels=CLOVA_CHANNELS,
+            )
 
         super().push_frame(frame)
 
