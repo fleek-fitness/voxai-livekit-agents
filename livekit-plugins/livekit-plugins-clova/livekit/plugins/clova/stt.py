@@ -66,7 +66,7 @@ class STT(stt.STT):
         *,
         client_secret: str,
         config: Optional[ClovaSTTConfig] = None,
-        default_timeout: float = 120.0,  # Add longer default timeout
+        default_timeout: float = 120.0,
     ):
         super().__init__(
             capabilities=stt.STTCapabilities(streaming=True, interim_results=True)
@@ -77,13 +77,14 @@ class STT(stt.STT):
 
         self._client_secret = client_secret
         self._config = config or ClovaSTTConfig()
-        self._channel: grpc.Channel | None = None
+        # Change to aio.Channel
+        self._channel: aio.Channel | None = None
         self._stub: nest_pb2_grpc.NestServiceStub | None = None
         self._streams = weakref.WeakSet()
         self._default_timeout = default_timeout
 
-        # Use synchronous grpc.secure_channel
-        self._channel = grpc.secure_channel(
+        # Use async channel
+        self._channel = aio.secure_channel(
             CLOVA_SERVER_URL,
             credentials=grpc.ssl_channel_credentials(),
             options=[
@@ -94,7 +95,7 @@ class STT(stt.STT):
                 ("grpc.enable_retries", 0),
             ],
         )
-        # Create synchronous stub
+        # Create stub
         self._stub = nest_pb2_grpc.NestServiceStub(self._channel)
 
     def stream(
@@ -222,7 +223,7 @@ class ClovaSpeechStream(stt.SpeechStream):
         Actual loop that streams audio to Clova's gRPC and yields partial/final results.
         """
 
-        async def request_iterator():  # Make this async again
+        async def request_iterator():
             try:
                 # 1) Send CONFIG request with a JSON config
                 config_dict = {"transcription": {"language": self._config.language}}
@@ -236,7 +237,7 @@ class ClovaSpeechStream(stt.SpeechStream):
                 seq_id = 0
                 while not self._closed:
                     try:
-                        # Use await with recv()
+                        # Use async receive
                         frame = await self._input_ch.recv()
                         if frame is None:
                             break
@@ -283,18 +284,17 @@ class ClovaSpeechStream(stt.SpeechStream):
             raise APIConnectionError("Clova stub not initialized")
 
         try:
-            # Use sync gRPC
-            response_stream = stub.recognize(
+            # Use async gRPC
+            response_stream = await stub.recognize(
                 request_iterator(),
                 metadata=metadata,
                 timeout=self._conn_options.timeout,
             )
 
-            # Use regular for loop instead of async for
-            for resp in response_stream:
+            # Use async for
+            async for resp in response_stream:
                 raw_contents = resp.contents
-
-                # Parse response and create event
+                # Rest of the processing remains the same
                 is_final = True
                 text = ""
                 try:
@@ -326,7 +326,6 @@ class ClovaSpeechStream(stt.SpeechStream):
                         type=event_type,
                         alternatives=[speech_data],
                     )
-                    # Use send_nowait instead of put
                     self._event_ch.send_nowait(event)
 
         except grpc.RpcError as e:
