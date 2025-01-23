@@ -77,26 +77,25 @@ class STT(stt.STT):
 
         self._client_secret = client_secret
         self._config = config or ClovaSTTConfig()
-        # Change to aio.Channel
-        self._channel: aio.Channel | None = None
-        self._stub: nest_pb2_grpc.NestServiceStub | None = None
         self._streams = weakref.WeakSet()
         self._default_timeout = default_timeout
 
-        # Use async channel with longer timeouts
+        # Create shared gRPC channel with optimized settings
         self._channel = aio.secure_channel(
             CLOVA_SERVER_URL,
             credentials=grpc.ssl_channel_credentials(),
             options=[
                 ("grpc.keepalive_time_ms", 30000),
-                ("grpc.keepalive_timeout_ms", 20000),  # Increased from 10000
+                ("grpc.keepalive_timeout_ms", 20000),
                 ("grpc.http2.min_time_between_pings_ms", 10000),
                 ("grpc.http2.max_pings_without_data", 0),
-                ("grpc.enable_retries", 1),  # Enable retries
+                ("grpc.enable_retries", 1),
                 ("grpc.max_receive_message_length", 10 * 1024 * 1024),  # 10MB
+                ("grpc.max_reconnect_backoff_ms", 5000),
             ],
         )
-        # Create stub
+
+        # Create shared stub
         self._stub = nest_pb2_grpc.NestServiceStub(self._channel)
 
     def stream(
@@ -173,9 +172,9 @@ class ClovaSpeechStream(stt.SpeechStream):
         self._closed = False
         self._buffer = bytearray()
         self._seq_id = 0
-        # Add accumulated text buffer
         self._current_text = ""
         self._speech_start_time = None
+        self._reconnect_event = asyncio.Event()
 
     def update_options(
         self,
@@ -185,6 +184,7 @@ class ClovaSpeechStream(stt.SpeechStream):
         """Change config in a live stream (if needed)."""
         if language is not None:
             self._config.language = language
+            self._reconnect_event.set()
 
     async def close(self) -> None:
         """Close the stream and cleanup resources."""
@@ -192,211 +192,220 @@ class ClovaSpeechStream(stt.SpeechStream):
             self._closed = True
             try:
                 if self._input_ch:
-                    self._input_ch.close()  # Remove await since Chan.close() is not async
+                    self._input_ch.close()
                 await asyncio.sleep(0)  # let tasks drain
             finally:
                 await super().close()
-
-    def push_frame(self, frame: rtc.AudioFrame) -> None:
-        """
-        Ensure the frame matches Clova's requirements:
-        - 16kHz sample rate
-        - 1 channel (mono)
-        - 16-bit samples (int16)
-        """
-        if self._closed:
-            return
-
-        # Convert if audio format doesn't match Clova requirements
-        if (
-            frame.sample_rate != CLOVA_SAMPLE_RATE
-            or frame.num_channels != CLOVA_CHANNELS
-        ):
-            # Use remix_and_resample for sample rate and channel conversion
-            frame = frame.remix_and_resample(
-                sample_rate=CLOVA_SAMPLE_RATE, num_channels=CLOVA_CHANNELS
-            )
-
-        # Note: AudioFrame already uses 16-bit samples (int16) internally
-        # so we don't need to convert bit depth
-
-        super().push_frame(frame)
 
     async def _run(self) -> None:
         """
         Actual loop that streams audio to Clova's gRPC and yields partial/final results.
         """
-
-        async def request_iterator():
+        while True:
             try:
-                # 1) Send CONFIG request with a JSON config
-                config_dict = {"transcription": {"language": self._config.language}}
 
-                yield nest_pb2.NestRequest(
-                    type=nest_pb2.RequestType.CONFIG,
-                    config=nest_pb2.NestConfig(config=json.dumps(config_dict)),
-                )
-
-                # 2) Then read frames from the queue and yield DATA requests
-                seq_id = 0
-                last_activity = time.time()
-                while not self._closed:
+                async def request_iterator():
                     try:
-                        # Use async receive with timeout
-                        frame = await asyncio.wait_for(
-                            self._input_ch.recv(),
-                            timeout=30.0,  # 30 second timeout for receiving frames
-                        )
-                        last_activity = time.time()
-
-                        if frame is None:
-                            break
-
-                        if not isinstance(frame, rtc.AudioFrame):
-                            continue
+                        # 1) Send CONFIG request with a JSON config
+                        config_dict = {
+                            "transcription": {"language": self._config.language}
+                        }
 
                         yield nest_pb2.NestRequest(
-                            type=nest_pb2.RequestType.DATA,
-                            data=nest_pb2.NestData(
-                                chunk=frame.data.tobytes(),
-                                extra_contents=json.dumps(
-                                    {"seqId": seq_id, "epFlag": False}
-                                ),
-                            ),
+                            type=nest_pb2.RequestType.CONFIG,
+                            config=nest_pb2.NestConfig(config=json.dumps(config_dict)),
                         )
-                        seq_id += 1
 
-                        # Check for inactivity timeout
-                        if (
-                            time.time() - last_activity > 60
-                        ):  # 60 second inactivity timeout
-                            logger.warning("Inactivity timeout reached, closing stream")
-                            break
+                        # 2) Then read frames from the queue and yield DATA requests
+                        seq_id = 0
+                        last_activity = time.time()
+                        while not self._closed:
+                            try:
+                                # Use async receive with timeout
+                                frame = await asyncio.wait_for(
+                                    self._input_ch.recv(),
+                                    timeout=30.0,  # 30 second timeout for receiving frames
+                                )
+                                last_activity = time.time()
 
-                    except asyncio.TimeoutError:
-                        logger.warning("Timeout waiting for audio frame")
-                        break
+                                if frame is None:
+                                    break
+
+                                if not isinstance(frame, rtc.AudioFrame):
+                                    continue
+
+                                yield nest_pb2.NestRequest(
+                                    type=nest_pb2.RequestType.DATA,
+                                    data=nest_pb2.NestData(
+                                        chunk=frame.data.tobytes(),
+                                        extra_contents=json.dumps(
+                                            {"seqId": seq_id, "epFlag": False}
+                                        ),
+                                    ),
+                                )
+                                seq_id += 1
+
+                                # Check for inactivity timeout
+                                if (
+                                    time.time() - last_activity > 60
+                                ):  # 60 second inactivity timeout
+                                    logger.warning(
+                                        "Inactivity timeout reached, closing stream"
+                                    )
+                                    break
+
+                            except asyncio.TimeoutError:
+                                logger.warning("Timeout waiting for audio frame")
+                                break
+                            except Exception as e:
+                                logger.error(f"Error processing frame: {e}")
+                                break
+
+                        # Send final chunk with epFlag=True
+                        if seq_id > 0:
+                            yield nest_pb2.NestRequest(
+                                type=nest_pb2.RequestType.DATA,
+                                data=nest_pb2.NestData(
+                                    chunk=b"",
+                                    extra_contents=json.dumps(
+                                        {"seqId": seq_id + 1, "epFlag": True}
+                                    ),
+                                ),
+                            )
                     except Exception as e:
-                        logger.error(f"Error processing frame: {e}")
-                        break
+                        logger.error(f"Error in request iterator: {e}")
+                        if not self._closed:
+                            self._closed = True
+                            if self._input_ch:
+                                self._input_ch.close()
+                        raise
 
-                # Send final chunk with epFlag=True
-                if seq_id > 0:
-                    yield nest_pb2.NestRequest(
-                        type=nest_pb2.RequestType.DATA,
-                        data=nest_pb2.NestData(
-                            chunk=b"",
-                            extra_contents=json.dumps(
-                                {"seqId": seq_id + 1, "epFlag": True}
-                            ),
-                        ),
-                    )
-            except Exception as e:
-                logger.error(f"Error in request iterator: {e}")
-                if not self._closed:
-                    self._closed = True
-                    if self._input_ch:
-                        self._input_ch.close()
-                raise
+                metadata = (("authorization", f"Bearer {self._client_secret}"),)
 
-        metadata = (("authorization", f"Bearer {self._client_secret}"),)
+                stub = self._stt._stub if self._stt else None
+                if not stub:
+                    raise APIConnectionError("Clova stub not initialized")
 
-        stub = self._stt._stub if self._stt else None
-        if not stub:
-            raise APIConnectionError("Clova stub not initialized")
+                tasks = []
+                wait_reconnect_task = asyncio.create_task(self._reconnect_event.wait())
 
-        try:
-            # Use a longer timeout for the gRPC call
-            response_stream = stub.recognize(
-                request_iterator(),
-                metadata=metadata,
-                timeout=300.0,  # 5 minute timeout for the entire stream
-            )
-
-            # Use async for with response stream
-            async for resp in response_stream:
-                raw_contents = resp.contents
                 try:
-                    j = json.loads(raw_contents)
+                    # Process responses
+                    response_stream = stub.recognize(
+                        request_iterator(),
+                        metadata=metadata,
+                        timeout=300.0,  # 5 minute timeout for the entire stream
+                    )
 
-                    # Handle config response
-                    if "config" in j:
-                        logger.debug(f"Received config response: {j}")
+                    async for resp in response_stream:
+                        raw_contents = resp.contents
+                        try:
+                            j = json.loads(raw_contents)
+
+                            # Handle config response
+                            if "config" in j:
+                                logger.debug(f"Received config response: {j}")
+                                continue
+
+                            # Handle transcription response
+                            if "transcription" in j:
+                                trans_obj = j["transcription"]
+                                text = trans_obj.get("text", "")
+                                ep_flag = bool(trans_obj.get("epFlag", False))
+                                is_final = ep_flag
+
+                                if text:
+                                    # Track speech start time
+                                    if self._speech_start_time is None:
+                                        self._speech_start_time = time.time()
+                                        self._event_ch.send_nowait(
+                                            stt.SpeechEvent(
+                                                type=stt.SpeechEventType.START_OF_SPEECH
+                                            )
+                                        )
+
+                                    # Accumulate text for interim results
+                                    if not is_final:
+                                        self._current_text += text
+                                        speech_data = stt.SpeechData(
+                                            text=self._current_text,
+                                            language=self._config.language,
+                                            confidence=1.0,
+                                            start_time=self._speech_start_time,
+                                            end_time=time.time(),
+                                        )
+                                        event = stt.SpeechEvent(
+                                            type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                                            alternatives=[speech_data],
+                                        )
+                                        self._event_ch.send_nowait(event)
+                                    else:
+                                        # For final results, send the complete text and reset
+                                        speech_data = stt.SpeechData(
+                                            text=self._current_text + text,
+                                            language=self._config.language,
+                                            confidence=1.0,
+                                            start_time=self._speech_start_time,
+                                            end_time=time.time(),
+                                        )
+                                        event = stt.SpeechEvent(
+                                            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                                            alternatives=[speech_data],
+                                        )
+                                        self._event_ch.send_nowait(event)
+
+                                        # Send end of speech event
+                                        self._event_ch.send_nowait(
+                                            stt.SpeechEvent(
+                                                type=stt.SpeechEventType.END_OF_SPEECH
+                                            )
+                                        )
+
+                                        # Reset for next utterance
+                                        self._current_text = ""
+                                        self._speech_start_time = None
+
+                        except ValueError as e:
+                            logger.error(f"Failed to parse response: {e}")
+
+                    # Check if we need to reconnect
+                    if wait_reconnect_task.done():
+                        self._reconnect_event.clear()
                         continue
+                    break
 
-                    # Handle transcription response
-                    if "transcription" in j:
-                        trans_obj = j["transcription"]
-                        text = trans_obj.get("text", "")
-                        ep_flag = bool(trans_obj.get("epFlag", False))
-                        is_final = ep_flag
+                except grpc.RpcError as e:
+                    code = e.code()
+                    # Map gRPC codes to your own error classes
+                    if code == grpc.StatusCode.UNAUTHENTICATED:
+                        raise APIStatusError(
+                            "Authentication failed", status_code=401
+                        ) from e
+                    elif code == grpc.StatusCode.INVALID_ARGUMENT:
+                        raise APIStatusError(
+                            "Invalid parameters", status_code=400
+                        ) from e
+                    elif code == grpc.StatusCode.RESOURCE_EXHAUSTED:
+                        raise APIStatusError(
+                            "Resource exhausted", status_code=429
+                        ) from e
+                    elif code == grpc.StatusCode.INTERNAL:
+                        raise APIStatusError(
+                            "Internal server error", status_code=500
+                        ) from e
+                    elif code == grpc.StatusCode.DEADLINE_EXCEEDED:
+                        logger.warning("Stream timeout, will reconnect")
+                        continue
+                    else:
+                        raise APIConnectionError(f"Clova gRPC error: {e}") from e
+                except Exception as ex:
+                    raise APIConnectionError(f"Unexpected error: {ex}") from ex
+                finally:
+                    await utils.aio.gracefully_cancel(wait_reconnect_task, *tasks)
 
-                        if text:
-                            # Track speech start time
-                            if self._speech_start_time is None:
-                                self._speech_start_time = time.time()
-                                self._event_ch.send_nowait(
-                                    stt.SpeechEvent(
-                                        type=stt.SpeechEventType.START_OF_SPEECH
-                                    )
-                                )
-
-                            # Accumulate text for interim results
-                            if not is_final:
-                                self._current_text += text
-                                speech_data = stt.SpeechData(
-                                    text=self._current_text,  # Send full accumulated text
-                                    language=self._config.language,
-                                    confidence=1.0,
-                                    start_time=self._speech_start_time,
-                                    end_time=time.time(),
-                                )
-                                event = stt.SpeechEvent(
-                                    type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
-                                    alternatives=[speech_data],
-                                )
-                                self._event_ch.send_nowait(event)
-                            else:
-                                # For final results, send the complete text and reset
-                                speech_data = stt.SpeechData(
-                                    text=self._current_text + text,
-                                    language=self._config.language,
-                                    confidence=1.0,
-                                    start_time=self._speech_start_time,
-                                    end_time=time.time(),
-                                )
-                                event = stt.SpeechEvent(
-                                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                                    alternatives=[speech_data],
-                                )
-                                self._event_ch.send_nowait(event)
-
-                                # Send end of speech event
-                                self._event_ch.send_nowait(
-                                    stt.SpeechEvent(
-                                        type=stt.SpeechEventType.END_OF_SPEECH
-                                    )
-                                )
-
-                                # Reset for next utterance
-                                self._current_text = ""
-                                self._speech_start_time = None
-
-                except ValueError as e:
-                    logger.error(f"Failed to parse response: {e}")
-
-        except grpc.RpcError as e:
-            code = e.code()
-            # Map gRPC codes to your own error classes
-            if code == grpc.StatusCode.UNAUTHENTICATED:
-                raise APIStatusError("Authentication failed", status_code=401) from e
-            elif code == grpc.StatusCode.INVALID_ARGUMENT:
-                raise APIStatusError("Invalid parameters", status_code=400) from e
-            elif code == grpc.StatusCode.RESOURCE_EXHAUSTED:
-                raise APIStatusError("Resource exhausted", status_code=429) from e
-            elif code == grpc.StatusCode.INTERNAL:
-                raise APIStatusError("Internal server error", status_code=500) from e
-            else:
-                raise APIConnectionError(f"Clova gRPC error: {e}") from e
-        except Exception as ex:
-            raise APIConnectionError(f"Unexpected error: {ex}") from ex
+            except Exception as e:
+                if isinstance(e, (APIStatusError, APIConnectionError)):
+                    raise
+                logger.exception("Error in stream, will retry")
+                await asyncio.sleep(1)  # Add delay before retry
+                continue
