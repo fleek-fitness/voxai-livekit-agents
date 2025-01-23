@@ -215,43 +215,82 @@ class ClovaSpeechStream(stt.SpeechStream):
         """
 
         async def request_iterator():
-            # 1) Send CONFIG request with a JSON config.
-            config_dict = {
-                "transcription": {"language": self._config.language},
-                # Add more fields as needed, e.g.:
-                # "keywordBoosting": {
-                #     "boostings": [
-                #         {"words": "apple,banana", "weight": 1.0},
-                #     ]
-                # },
-                # "forbidden": {"forbiddens": "badword1,badword2"},
-                # "semanticEpd": {"useWordEpd": True, "usePeriodEpd": True, ...}
-            }
-            yield nest_pb2.NestRequest(
-                type=nest_pb2.CONFIG,
-                config=nest_pb2.NestConfig(config=json.dumps(config_dict)),
-            )
-
-            # 2) Then read frames from the queue => yield DATA requests
-            #    We keep sending until we get None or the stream is closed.
-            seq_id = 0
-            while True:
-                frame = await self._input_ch.get()
-                if frame is None:
-                    break  # signals done
-                if not isinstance(frame, rtc.AudioFrame):
-                    continue
-
-                seq_id += 1
-                # epFlag => if we set it true at some point, Clova flushes buffers.
-                # For a continuous stream, we keep it False until the final chunk.
-                yield nest_pb2.NestRequest(
-                    type=nest_pb2.DATA,
-                    data=nest_pb2.NestData(
-                        chunk=frame.data,
-                        extra_contents=json.dumps({"seqId": seq_id, "epFlag": False}),
+            try:
+                # 1) Send CONFIG request with a JSON config.
+                config_dict = {
+                    "transcription": {"language": self._config.language},
+                    # Add optional fields if configured
+                    **(
+                        {
+                            "keywordBoosting": {
+                                "boostings": self._config.keyword_boosting
+                            }
+                        }
+                        if self._config.keyword_boosting
+                        else {}
                     ),
+                    **(
+                        {"forbidden": {"forbiddens": self._config.forbidden_words}}
+                        if self._config.forbidden_words
+                        else {}
+                    ),
+                    **(
+                        {"semanticEpd": self._config.semantic_epd}
+                        if self._config.semantic_epd
+                        else {}
+                    ),
+                }
+
+                yield nest_pb2.NestRequest(
+                    type=nest_pb2.RequestType.CONFIG,
+                    config=nest_pb2.NestConfig(config=json.dumps(config_dict)),
                 )
+
+                # 2) Then read frames from the queue and yield DATA requests
+                seq_id = 0
+                while not self._closed:  # Check _closed flag
+                    try:
+                        frame = (
+                            await self._input_ch.receive()
+                        )  # Changed from get() to receive()
+                        if frame is None:
+                            break
+
+                        if not isinstance(frame, rtc.AudioFrame):
+                            continue
+
+                        seq_id += 1
+                        yield nest_pb2.NestRequest(
+                            type=nest_pb2.RequestType.DATA,
+                            data=nest_pb2.NestData(
+                                chunk=frame.data.tobytes(),
+                                extra_contents=json.dumps(
+                                    {"seqId": seq_id, "epFlag": False}
+                                ),
+                            ),
+                        )
+                    except asyncio.CancelledError:
+                        # Handle cancellation gracefully
+                        break
+                    except Exception as e:
+                        logger.error(f"Error processing frame: {e}")
+                        break
+
+                # Send final chunk with epFlag=True if we have data
+                if seq_id > 0:
+                    yield nest_pb2.NestRequest(
+                        type=nest_pb2.RequestType.DATA,
+                        data=nest_pb2.NestData(
+                            chunk=b"",  # Empty chunk for final message
+                            extra_contents=json.dumps(
+                                {"seqId": seq_id + 1, "epFlag": True}
+                            ),
+                        ),
+                    )
+            finally:
+                # Ensure cleanup happens
+                if not self._closed:
+                    await self.close()
 
         metadata = (("authorization", f"Bearer {self._client_secret}"),)
 
