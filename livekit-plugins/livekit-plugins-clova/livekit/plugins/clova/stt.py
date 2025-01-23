@@ -55,7 +55,7 @@ class ClovaSTTConfig:
     channels: int = CLOVA_CHANNELS
 
 
-class CLOVA(stt.STT):
+class STT(stt.STT):
     """
     CLOVA streaming STT plugin that matches the Clova docs:
     https://api.ncloud-docs.com/docs/en/clova-speech-stt-stt
@@ -151,7 +151,7 @@ class ClovaSpeechStream(stt.SpeechStream):
     def __init__(
         self,
         *,
-        stt: CLOVA,
+        stt: STT,
         config: ClovaSTTConfig,
         conn_options: APIConnectOptions,
         client_secret: str,
