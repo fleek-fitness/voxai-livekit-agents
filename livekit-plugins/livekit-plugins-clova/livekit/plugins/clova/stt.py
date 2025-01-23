@@ -26,7 +26,8 @@ from . import nest_pb2_grpc
 
 logger = logging.getLogger(__name__)
 
-CLOVA_SERVER_URL = "clovaspeech-gw.ncloud.com:443"
+# Change port from 443 to 50051 as per Clova docs
+CLOVA_SERVER_URL = "clovaspeech-gw.ncloud.com:50051"
 
 DEFAULT_API_CONNECT_OPTIONS = APIConnectOptions()
 
@@ -65,6 +66,7 @@ class STT(stt.STT):
         *,
         client_secret: str,
         config: Optional[ClovaSTTConfig] = None,
+        default_timeout: float = 120.0,  # Add longer default timeout
     ):
         super().__init__(
             capabilities=stt.STTCapabilities(streaming=True, interim_results=True)
@@ -78,8 +80,9 @@ class STT(stt.STT):
         self._channel: aio.Channel | None = None
         self._stub: nest_pb2_grpc.NestServiceStub | None = None
         self._streams = weakref.WeakSet()
+        self._default_timeout = default_timeout
 
-        # Create a gRPC channel with optimized settings
+        # Create gRPC channel with correct port and without ssl override
         self._channel = aio.secure_channel(
             CLOVA_SERVER_URL,
             credentials=grpc.ssl_channel_credentials(),
@@ -89,7 +92,7 @@ class STT(stt.STT):
                 ("grpc.http2.min_time_between_pings_ms", 10000),
                 ("grpc.http2.max_pings_without_data", 0),
                 ("grpc.enable_retries", 0),
-                ("grpc.ssl_target_name_override", "clovaspeech-gw.ncloud.com"),
+                # Remove ssl_target_name_override as it's not needed
             ],
         )
         # Create the stub
