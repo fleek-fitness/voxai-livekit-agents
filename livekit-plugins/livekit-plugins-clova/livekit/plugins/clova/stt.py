@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import logging
 import time
 import weakref
 from dataclasses import dataclass
@@ -20,16 +21,12 @@ from livekit.agents import (
     DEFAULT_API_CONNECT_OPTIONS,
 )
 
-
-DEFAULT_API_CONNECT_OPTIONS = APIConnectOptions()
-
-# Now import the generated proto classes:
-# import nest_pb2
-# import nest_pb2_grpc
 from . import nest_pb2
 from . import nest_pb2_grpc
 
-CLOVA_SERVER_URL = "clovaspeech-gw.ncloud.com:50051"
+logger = logging.getLogger(__name__)
+
+DEFAULT_API_CONNECT_OPTIONS = APIConnectOptions()
 
 # Audio format requirements from Clova docs
 CLOVA_SAMPLE_RATE = 16000  # 16kHz required
@@ -160,6 +157,8 @@ class ClovaSpeechStream(stt.SpeechStream):
         self._config = config
         self._client_secret = client_secret
         self._closed = False
+        self._buffer = bytearray()
+        self._seq_id = 0
 
     def update_options(
         self,
@@ -170,19 +169,12 @@ class ClovaSpeechStream(stt.SpeechStream):
         if language is not None:
             self._config.language = language
 
-    async def close(self):
-        """Close this stream gracefully."""
-        if self._closed:
-            return
-        self._closed = True
-
-        try:
+    async def close(self) -> None:
+        """Close the stream and cleanup resources."""
+        if not self._closed:
+            self._closed = True
             if self._input_ch:
-                await self._input_ch.put(None)  # or just close the queue
-        except:
-            pass
-
-        await super().close()
+                await self._input_ch.aclose()  # Use aclose() instead of close()
 
     def push_frame(self, frame: rtc.AudioFrame) -> None:
         """
@@ -216,10 +208,9 @@ class ClovaSpeechStream(stt.SpeechStream):
 
         async def request_iterator():
             try:
-                # 1) Send CONFIG request with a JSON config.
+                # 1) Send CONFIG request with a JSON config
                 config_dict = {
                     "transcription": {"language": self._config.language},
-                    # Add optional fields if configured
                     **(
                         {
                             "keywordBoosting": {
@@ -248,11 +239,10 @@ class ClovaSpeechStream(stt.SpeechStream):
 
                 # 2) Then read frames from the queue and yield DATA requests
                 seq_id = 0
-                while not self._closed:  # Check _closed flag
+                while not self._closed:
                     try:
-                        frame = (
-                            await self._input_ch.receive()
-                        )  # Changed from get() to receive()
+                        # Use arecv() for async channel receive
+                        frame = await self._input_ch.arecv()
                         if frame is None:
                             break
 
@@ -270,7 +260,7 @@ class ClovaSpeechStream(stt.SpeechStream):
                             ),
                         )
                     except asyncio.CancelledError:
-                        # Handle cancellation gracefully
+                        logger.debug("Stream cancelled")
                         break
                     except Exception as e:
                         logger.error(f"Error processing frame: {e}")
@@ -281,7 +271,7 @@ class ClovaSpeechStream(stt.SpeechStream):
                     yield nest_pb2.NestRequest(
                         type=nest_pb2.RequestType.DATA,
                         data=nest_pb2.NestData(
-                            chunk=b"",  # Empty chunk for final message
+                            chunk=b"",
                             extra_contents=json.dumps(
                                 {"seqId": seq_id + 1, "epFlag": True}
                             ),
