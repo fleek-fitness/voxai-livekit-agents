@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 from livekit import rtc
 
-from . import STT, STTCapabilities, SpeechEvent
+from . import STT, STTCapabilities, SpeechEvent, StreamAdapter
 from ..log import logger
 
 
@@ -18,7 +18,7 @@ class StoredResult:
     provider: STT
 
 
-class FallbackSTT(STT):
+class FallbackSTT(StreamAdapter):
     """
     A wrapper that runs two STT providers in parallel, using whichever gives a valid result first,
     while preferring the primary provider when both return results.
@@ -145,13 +145,3 @@ class FallbackSTT(STT):
     async def aclose(self):
         """Close both STT providers."""
         await asyncio.gather(self._primary.aclose(), self._secondary.aclose())
-
-    async def _recognize_impl(self, *args, **kwargs):
-        """
-        This implementation is not used since we delegate all recognition
-        to the primary and secondary providers.
-        """
-        raise NotImplementedError(
-            "FallbackSTT does not implement recognition directly - "
-            "it delegates to primary and secondary providers"
-        )
