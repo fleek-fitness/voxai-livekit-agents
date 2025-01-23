@@ -222,7 +222,7 @@ class ClovaSpeechStream(stt.SpeechStream):
         Actual loop that streams audio to Clova's gRPC and yields partial/final results.
         """
 
-        def request_iterator():  # Remove async, make it a regular generator
+        async def request_iterator():  # Make this async again
             try:
                 # 1) Send CONFIG request with a JSON config
                 config_dict = {"transcription": {"language": self._config.language}}
@@ -236,8 +236,8 @@ class ClovaSpeechStream(stt.SpeechStream):
                 seq_id = 0
                 while not self._closed:
                     try:
-                        # Use sync channel receive
-                        frame = self._input_ch.recv()
+                        # Use await with recv()
+                        frame = await self._input_ch.recv()
                         if frame is None:
                             break
 
