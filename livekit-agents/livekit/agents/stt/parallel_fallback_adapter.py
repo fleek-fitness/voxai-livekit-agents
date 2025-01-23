@@ -352,9 +352,19 @@ class FallbackRecognizeStream(RecognizeStream):
         self._recovering_streams: list[RecognizeStream] = []
         self._active_streams: list[RecognizeStream] = []
         self._forward_input_task: asyncio.Task | None = None
+        self._is_closed = False
+        self._last_activity_time = time.time()
+
+    def push_frame(self, frame: rtc.AudioFrame) -> None:
+        """Override push_frame to update activity timestamp"""
+        self._last_activity_time = time.time()
+        if not self._is_closed:
+            super().push_frame(frame)
 
     async def _cleanup_streams(self) -> None:
         """Clean up all active and recovery streams."""
+        self._is_closed = True
+
         # Cancel forward input task if it exists
         if self._forward_input_task and not self._forward_input_task.done():
             await aio.gracefully_cancel(self._forward_input_task)
@@ -477,16 +487,30 @@ class FallbackRecognizeStream(RecognizeStream):
         """Reads from self._input_ch and forwards audio frames to each stream in parallel."""
         try:
             async for data in self._input_ch:
+                # Check for inactivity timeout
+                if time.time() - self._last_activity_time > 30:  # 30 second timeout
+                    logger.warning("Stream inactive for too long, closing")
+                    break
+
                 for stream in streams:
-                    if isinstance(data, rtc.AudioFrame):
-                        stream.push_frame(data)
-                    elif isinstance(data, self._FlushSentinel):
-                        stream.flush()
-            for stream in streams:
-                stream.end_input()
-        except Exception:
-            # Suppress errors during cleanup
-            pass
+                    try:
+                        if isinstance(data, rtc.AudioFrame):
+                            stream.push_frame(data)
+                        elif isinstance(data, self._FlushSentinel):
+                            stream.flush()
+                    except Exception as e:
+                        logger.warning(f"Error forwarding data to stream: {e}")
+                        continue
+
+            # Only end input if we haven't timed out
+            if time.time() - self._last_activity_time <= 30:
+                for stream in streams:
+                    try:
+                        stream.end_input()
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning(f"Error in forward input task: {e}")
 
     async def _consume_stream(self, idx: int, stream: RecognizeStream):
         """
@@ -498,17 +522,19 @@ class FallbackRecognizeStream(RecognizeStream):
         try:
             async with stream:
                 async for ev in stream:
-                    # Forward *all* events up the chain if you wish
-                    self._event_ch.send_nowait(ev)
+                    if self._is_closed:
+                        return None
 
-                    # If a final transcript has text, we can either immediately
-                    # return it, or accumulate. Here, we'll just return on the
-                    # first non-empty final. That ensures *this* consumption
-                    # finishes quickly.
+                    try:
+                        self._event_ch.send_nowait(ev)
+                    except Exception:
+                        if self._is_closed:
+                            return None
+                        raise
+
                     if ev.type in SpeechEventType.FINAL_TRANSCRIPT:
                         if ev.alternatives and ev.alternatives[0].text.strip():
                             return ev
-            # If the stream ended normally but no final transcript with text
             return None
         except asyncio.TimeoutError:
             logger.warning(
@@ -529,7 +555,9 @@ class FallbackRecognizeStream(RecognizeStream):
                 extra={"streamed": True},
             )
             raise
-        except Exception:
+        except Exception as e:
+            if self._is_closed:
+                return None
             logger.exception(
                 f"{stt.label} unexpected error in streaming, switching to next STT",
                 extra={"streamed": True},
