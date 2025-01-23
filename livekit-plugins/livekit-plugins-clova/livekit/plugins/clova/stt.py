@@ -294,37 +294,27 @@ class ClovaSpeechStream(stt.SpeechStream):
             for resp in response_stream:
                 raw_contents = resp.contents
 
-                # Clova often returns JSON in resp.contents, but sometimes it can be raw text
-                # Attempt to parse as JSON
+                # Parse response and create event
                 is_final = True
                 text = ""
                 try:
                     j = json.loads(raw_contents)
-                    # If there's a top-level key "transcription", parse it
                     if "transcription" in j:
                         trans_obj = j["transcription"]
                         text = trans_obj.get("text", "")
-                        # epFlag => if True, treat as final
-                        # if False, treat as partial (if you want partial).
-                        # We interpret epFlag's presence:
                         ep_flag = bool(trans_obj.get("epFlag", False))
-                        is_final = ep_flag  # epFlag=True => final
+                        is_final = ep_flag
                     else:
-                        # If there's no "transcription", fallback to raw text
                         text = raw_contents
                 except ValueError:
-                    # Not JSON => treat as raw text
                     text = raw_contents
 
-                # 5) Send a SpeechEvent with either partial or final type
                 if text:
                     event_type = (
                         stt.SpeechEventType.FINAL_TRANSCRIPT
                         if is_final
                         else stt.SpeechEventType.INTERIM_TRANSCRIPT
                     )
-                    # Confidence might also come from j["transcription"].get("confidence")
-                    # startTimestamp, endTimestamp, etc. can be found if needed
                     speech_data = stt.SpeechData(
                         text=text,
                         language=self._config.language,
@@ -336,7 +326,8 @@ class ClovaSpeechStream(stt.SpeechStream):
                         type=event_type,
                         alternatives=[speech_data],
                     )
-                    await self._event_ch.put(event)
+                    # Use send_nowait instead of put
+                    self._event_ch.send_nowait(event)
 
         except grpc.RpcError as e:
             code = e.code()
