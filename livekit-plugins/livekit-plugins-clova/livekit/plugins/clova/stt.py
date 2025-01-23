@@ -294,39 +294,57 @@ class ClovaSpeechStream(stt.SpeechStream):
             # Use async for with response stream
             async for resp in response_stream:
                 raw_contents = resp.contents
-                # Rest of the processing remains the same
-                is_final = True
-                text = ""
                 try:
                     j = json.loads(raw_contents)
+
+                    # Handle config response
+                    if "config" in j:
+                        logger.debug(f"Received config response: {j}")
+                        continue  # Skip sending event for config responses
+
+                    # Handle transcription response
                     if "transcription" in j:
                         trans_obj = j["transcription"]
                         text = trans_obj.get("text", "")
                         ep_flag = bool(trans_obj.get("epFlag", False))
                         is_final = ep_flag
-                    else:
-                        text = raw_contents
-                except ValueError:
-                    text = raw_contents
 
-                if text:
-                    event_type = (
-                        stt.SpeechEventType.FINAL_TRANSCRIPT
-                        if is_final
-                        else stt.SpeechEventType.INTERIM_TRANSCRIPT
-                    )
-                    speech_data = stt.SpeechData(
-                        text=text,
-                        language=self._config.language,
-                        confidence=1.0,
-                        start_time=0,
-                        end_time=0,
-                    )
-                    event = stt.SpeechEvent(
-                        type=event_type,
-                        alternatives=[speech_data],
-                    )
-                    self._event_ch.send_nowait(event)
+                        if text:
+                            event_type = (
+                                stt.SpeechEventType.FINAL_TRANSCRIPT
+                                if is_final
+                                else stt.SpeechEventType.INTERIM_TRANSCRIPT
+                            )
+                            speech_data = stt.SpeechData(
+                                text=text,
+                                language=self._config.language,
+                                confidence=1.0,
+                                start_time=time.time(),  # Add timestamps
+                                end_time=time.time(),
+                            )
+                            event = stt.SpeechEvent(
+                                type=event_type,
+                                alternatives=[speech_data],
+                            )
+                            self._event_ch.send_nowait(event)
+                    else:
+                        # Handle raw text response
+                        text = raw_contents
+                        if text:
+                            speech_data = stt.SpeechData(
+                                text=text,
+                                language=self._config.language,
+                                confidence=1.0,
+                                start_time=time.time(),  # Add timestamps
+                                end_time=time.time(),
+                            )
+                            event = stt.SpeechEvent(
+                                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                                alternatives=[speech_data],
+                            )
+                            self._event_ch.send_nowait(event)
+                except ValueError as e:
+                    logger.error(f"Failed to parse response: {e}")
 
         except grpc.RpcError as e:
             code = e.code()
