@@ -26,6 +26,8 @@ from . import nest_pb2_grpc
 
 logger = logging.getLogger(__name__)
 
+CLOVA_SERVER_URL = "clovaspeech-gw.ncloud.com:443"
+
 DEFAULT_API_CONNECT_OPTIONS = APIConnectOptions()
 
 # Audio format requirements from Clova docs
