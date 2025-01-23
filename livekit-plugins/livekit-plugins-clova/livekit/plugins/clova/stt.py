@@ -186,25 +186,26 @@ class ClovaSpeechStream(stt.SpeechStream):
 
     def push_frame(self, frame: rtc.AudioFrame) -> None:
         """
-        Optionally ensure the frame is 16kHz / mono / 16-bit.
-        If not, convert it. This example is minimal.
+        Ensure the frame matches Clova's requirements:
+        - 16kHz sample rate
+        - 1 channel (mono)
+        - 16-bit samples (int16)
         """
         if self._closed:
             return
 
-        # Example: if the incoming frame has the wrong sample rate, convert it.
-        # (Real code would do actual resampling or rely on upstream logic.)
+        # Convert if audio format doesn't match Clova requirements
         if (
             frame.sample_rate != CLOVA_SAMPLE_RATE
-            or frame.num_channels
-            != CLOVA_CHANNELS  # Changed from channels to num_channels
-            or frame.sample_width != CLOVA_BITS_PER_SAMPLE // 8
+            or frame.num_channels != CLOVA_CHANNELS
         ):
-            frame = frame.convert(
-                sample_rate=CLOVA_SAMPLE_RATE,
-                sample_width=CLOVA_BITS_PER_SAMPLE // 8,
-                channels=CLOVA_CHANNELS,
+            # Use remix_and_resample for sample rate and channel conversion
+            frame = frame.remix_and_resample(
+                sample_rate=CLOVA_SAMPLE_RATE, num_channels=CLOVA_CHANNELS
             )
+
+        # Note: AudioFrame already uses 16-bit samples (int16) internally
+        # so we don't need to convert bit depth
 
         super().push_frame(frame)
 
