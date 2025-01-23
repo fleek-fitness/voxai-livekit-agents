@@ -77,12 +77,12 @@ class STT(stt.STT):
 
         self._client_secret = client_secret
         self._config = config or ClovaSTTConfig()
-        self._channel: aio.Channel | None = None
+        self._channel: grpc.Channel | None = None
         self._stub: nest_pb2_grpc.NestServiceStub | None = None
         self._streams = weakref.WeakSet()
         self._default_timeout = default_timeout
 
-        # Create gRPC channel with correct port and without ssl override
+        # Use synchronous grpc.secure_channel
         self._channel = grpc.secure_channel(
             CLOVA_SERVER_URL,
             credentials=grpc.ssl_channel_credentials(),
@@ -92,10 +92,9 @@ class STT(stt.STT):
                 ("grpc.http2.min_time_between_pings_ms", 10000),
                 ("grpc.http2.max_pings_without_data", 0),
                 ("grpc.enable_retries", 0),
-                # Remove ssl_target_name_override as it's not needed
             ],
         )
-        # Create the stub
+        # Create synchronous stub
         self._stub = nest_pb2_grpc.NestServiceStub(self._channel)
 
     def stream(
@@ -223,7 +222,7 @@ class ClovaSpeechStream(stt.SpeechStream):
         Actual loop that streams audio to Clova's gRPC and yields partial/final results.
         """
 
-        async def request_iterator():
+        def request_iterator():  # Remove async, make it a regular generator
             try:
                 # 1) Send CONFIG request with a JSON config
                 config_dict = {"transcription": {"language": self._config.language}}
@@ -237,14 +236,14 @@ class ClovaSpeechStream(stt.SpeechStream):
                 seq_id = 0
                 while not self._closed:
                     try:
-                        frame = await self._input_ch.recv()
+                        # Use sync channel receive
+                        frame = self._input_ch.recv()
                         if frame is None:
                             break
 
                         if not isinstance(frame, rtc.AudioFrame):
                             continue
 
-                        # Send audio in chunks of 32000 bytes as per docs
                         yield nest_pb2.NestRequest(
                             type=nest_pb2.RequestType.DATA,
                             data=nest_pb2.NestData(
@@ -255,8 +254,6 @@ class ClovaSpeechStream(stt.SpeechStream):
                             ),
                         )
                         seq_id += 1
-                    except asyncio.CancelledError:
-                        break
                     except Exception as e:
                         logger.error(f"Error processing frame: {e}")
                         break
@@ -279,7 +276,6 @@ class ClovaSpeechStream(stt.SpeechStream):
                         self._input_ch.close()
                 raise
 
-        # Use Bearer token as shown in docs
         metadata = (("authorization", f"Bearer {self._client_secret}"),)
 
         stub = self._stt._stub if self._stt else None
@@ -287,14 +283,15 @@ class ClovaSpeechStream(stt.SpeechStream):
             raise APIConnectionError("Clova stub not initialized")
 
         try:
+            # Use sync gRPC
             response_stream = stub.recognize(
                 request_iterator(),
                 metadata=metadata,
                 timeout=self._conn_options.timeout,
             )
 
-            # 4) Process responses from Clova
-            async for resp in response_stream:
+            # Use regular for loop instead of async for
+            for resp in response_stream:
                 raw_contents = resp.contents
 
                 # Clova often returns JSON in resp.contents, but sometimes it can be raw text
