@@ -57,6 +57,7 @@ class ParallelFallbackAdapter(
         attempt_timeout: float = 10.0,
         max_retry_per_stt: int = 1,
         retry_interval: float = 5,
+        recovery_timeout: float = 30.0,
     ) -> None:
         if len(stt) < 1:
             raise ValueError("At least one STT instance must be provided.")
@@ -73,6 +74,7 @@ class ParallelFallbackAdapter(
         self._attempt_timeout = attempt_timeout
         self._max_retry_per_stt = max_retry_per_stt
         self._retry_interval = retry_interval
+        self._recovery_timeout = recovery_timeout
 
         self._status: list[_STTStatus] = [
             _STTStatus(
@@ -160,33 +162,42 @@ class ParallelFallbackAdapter(
         """
         stt_status = self._status[self._stt_instances.index(stt)]
         if (
-            stt_status.recovering_synthesize_task is None
-            or stt_status.recovering_synthesize_task.done()
+            stt_status.recovering_synthesize_task is not None
+            and not stt_status.recovering_synthesize_task.done()
         ):
+            # Already recovering
+            return
 
-            async def _recover_stt_task(stt: STT) -> None:
-                try:
-                    await self._try_recognize(
+        async def _recover_stt_task(stt: STT) -> None:
+            try:
+                # Use timeout for recovery attempts
+                await asyncio.wait_for(
+                    self._try_recognize(
                         stt=stt,
                         buffer=buffer,
                         language=language,
                         conn_options=conn_options,
                         recovering=True,
-                    )
-                    # If the above doesn't raise, we can mark STT as recovered
-                    stt_status.available = True
-                    logger.info(f"{stt.label} recovered")
-                    self.emit(
-                        "stt_availability_changed",
-                        AvailabilityChangedEvent(stt=stt, available=True),
-                    )
-                except Exception:
-                    # If we still fail, remain unavailable
-                    return
+                    ),
+                    timeout=self._recovery_timeout,
+                )
+                # Only mark as recovered if we get here
+                stt_status.available = True
+                logger.info(f"{stt.label} recovered")
+                self.emit(
+                    "stt_availability_changed",
+                    AvailabilityChangedEvent(stt=stt, available=True),
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"{stt.label} recovery timed out after {self._recovery_timeout}s"
+                )
+            except Exception:
+                logger.exception(f"{stt.label} recovery failed")
 
-            stt_status.recovering_synthesize_task = asyncio.create_task(
-                _recover_stt_task(stt)
-            )
+        stt_status.recovering_synthesize_task = asyncio.create_task(
+            _recover_stt_task(stt)
+        )
 
     async def _recognize_impl(
         self,
