@@ -175,8 +175,12 @@ class ClovaSpeechStream(stt.SpeechStream):
         """Close the stream and cleanup resources."""
         if not self._closed:
             self._closed = True
-            if self._input_ch:
-                await self._input_ch.close()  # Use close() instead of aclose()
+            try:
+                if self._input_ch:
+                    self._input_ch.close()  # Remove await since Chan.close() is not async
+                await asyncio.sleep(0)  # let tasks drain
+            finally:
+                await super().close()
 
     def push_frame(self, frame: rtc.AudioFrame) -> None:
         """
@@ -243,8 +247,9 @@ class ClovaSpeechStream(stt.SpeechStream):
                 seq_id = 0
                 while not self._closed:
                     try:
-                        # Use recv() instead of arecv()
-                        frame = await self._input_ch.recv()
+                        frame = (
+                            await self._input_ch.recv()
+                        )  # Use recv() instead of arecv()
                         if frame is None:
                             break
 
@@ -279,10 +284,12 @@ class ClovaSpeechStream(stt.SpeechStream):
                             ),
                         ),
                     )
-            finally:
-                # Ensure cleanup happens
+            except Exception:
                 if not self._closed:
-                    await self.close()
+                    self._closed = True
+                    if self._input_ch:
+                        self._input_ch.close()  # Close without await
+                raise
 
         metadata = (("authorization", f"Bearer {self._client_secret}"),)
 
