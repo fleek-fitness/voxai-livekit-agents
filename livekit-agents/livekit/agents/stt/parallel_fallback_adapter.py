@@ -342,7 +342,7 @@ class FallbackRecognizeStream(RecognizeStream):
     def __init__(
         self,
         *,
-        stt: FallbackAdapter,
+        stt: ParallelFallbackAdapter,
         language: str | None,
         conn_options: APIConnectOptions,
     ):

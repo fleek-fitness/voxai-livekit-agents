@@ -30,7 +30,7 @@ from livekit.agents import (
     stt,
     utils,
 )
-from livekit.agents.stt import SpeechEventType, STTCapabilities
+from livekit.agents.stt import SpeechEventType, STTCapabilities, RecognizeStream
 from livekit.agents.utils import AudioBuffer, merge_frames
 from livekit.plugins.clova.constants import CLOVA_INPUT_SAMPLE_RATE
 
