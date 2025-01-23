@@ -31,7 +31,6 @@ setuptools.setup(
     long_description=(here / "README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
     url="https://github.com/livekit/agents",
-    cmdclass={},
     classifiers=[
         "Intended Audience :: Developers",
         "License :: OSI Approved :: Apache Software License",
@@ -43,11 +42,20 @@ setuptools.setup(
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3 :: Only",
     ],
-    keywords=["webrtc", "realtime", "audio", "video", "livekit"],
+    keywords=["webrtc", "realtime", "audio", "video", "livekit", "stt", "clova"],
     license="Apache-2.0",
     packages=setuptools.find_namespace_packages(include=["livekit.*"]),
     python_requires=">=3.9.0",
-    install_requires=["livekit-agents>=0.12.3", "pydub~=0.25.1"],
+    install_requires=[
+        "livekit-agents>=0.12.3",
+        "grpcio==1.67.1",  # Pin to specific version
+        "grpcio-tools==1.67.1",  # Match grpcio version
+        "protobuf>=4.24.0",
+        "pydub>=0.25.1",
+    ],
+    package_data={
+        "livekit.plugins.clova": ["*.proto"],  # Include proto files
+    },
     project_urls={
         "Documentation": "https://docs.livekit.io",
         "Website": "https://livekit.io/",
