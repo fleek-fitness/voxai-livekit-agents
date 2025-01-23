@@ -176,7 +176,7 @@ class ClovaSpeechStream(stt.SpeechStream):
         if not self._closed:
             self._closed = True
             if self._input_ch:
-                await self._input_ch.aclose()  # Use aclose() instead of close()
+                await self._input_ch.close()  # Use close() instead of aclose()
 
     def push_frame(self, frame: rtc.AudioFrame) -> None:
         """
@@ -243,8 +243,8 @@ class ClovaSpeechStream(stt.SpeechStream):
                 seq_id = 0
                 while not self._closed:
                     try:
-                        # Use arecv() for async channel receive
-                        frame = await self._input_ch.arecv()
+                        # Use recv() instead of arecv()
+                        frame = await self._input_ch.recv()
                         if frame is None:
                             break
 
