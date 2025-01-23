@@ -29,15 +29,18 @@ class FallbackSTT(STT):
         primary: STT,
         secondary: STT,
     ):
-        super().__init__()
-        self._primary = primary
-        self._secondary = secondary
-
-        self._capabilities = STTCapabilities(
+        # Calculate capabilities before calling super().__init__()
+        capabilities = STTCapabilities(
             streaming=(
                 primary.capabilities.streaming and secondary.capabilities.streaming
             )
         )
+
+        # Pass capabilities to parent class
+        super().__init__(capabilities=capabilities)
+
+        self._primary = primary
+        self._secondary = secondary
 
         # Store results from both providers
         self._primary_result: Optional[StoredResult] = None
