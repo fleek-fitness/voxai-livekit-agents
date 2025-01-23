@@ -1,310 +1,624 @@
+from __future__ import annotations
+
 import asyncio
 import contextlib
+import dataclasses
 import time
 from dataclasses import dataclass
-from typing import Literal, List, Optional
+from typing import Literal
 
 from livekit import rtc
 from livekit.agents.utils.audio import AudioBuffer
 
+from .. import utils
 from .._exceptions import APIConnectionError, APIError
+from ..log import logger
 from ..types import DEFAULT_API_CONNECT_OPTIONS, APIConnectOptions
 from ..utils import aio
-from ..log import logger
-from .stt import STT, STTCapabilities, RecognizeStream, SpeechEvent, SpeechEventType
+from .stt import STT, RecognizeStream, SpeechEvent, SpeechEventType, STTCapabilities
 
-DEFAULT_PARALLEL_API_CONNECT_OPTIONS = APIConnectOptions(
-    max_retry=0,
-    timeout=DEFAULT_API_CONNECT_OPTIONS.timeout,
+# don't retry when using the fallback adapter
+DEFAULT_FALLBACK_API_CONNECT_OPTIONS = APIConnectOptions(
+    max_retry=0, timeout=DEFAULT_API_CONNECT_OPTIONS.timeout
 )
 
 
 @dataclass
-class FallbackResult:
-    """
-    Simple helper to store which STT succeeded and the final transcript event.
-    """
-
-    stt_index: int
-    event: SpeechEvent
+class AvailabilityChangedEvent:
+    stt: STT
+    available: bool
 
 
-class ParallelFallbackSTT(STT[Literal["stt_availability_changed"]]):
+@dataclass
+class _STTStatus:
+    available: bool
+    recovering_synthesize_task: asyncio.Task | None
+    recovering_stream_task: asyncio.Task | None
+
+
+class ParallelFallbackAdapter(
+    STT[Literal["stt_availability_changed"]],
+):
     """
-    Run multiple STT providers in parallel for each utterance:
-      1) Everyone is fed the same audio in real time.
-      2) We wait on final transcripts from the STTs in priority order:
-         - If STT #0 has a final transcript with non-empty text => done
-         - Else if STT #0 was empty or failed => check STT #1, etc.
-      3) If none yield a non-empty final, raise an error.
+    Modified FallbackAdapter that runs multiple STTs *in parallel*. After collecting
+    all their results (or exceptions/timeouts), it picks the final transcript in
+    *priority order*:
+        1) stt0's result (if valid & non-empty)
+        2) stt1's result (if valid & non-empty)
+        3) etc.
+
+    If none gave a valid transcript, it raises an APIConnectionError.
     """
 
     def __init__(
         self,
-        stt_list: List[STT],
-        conn_options: APIConnectOptions = DEFAULT_PARALLEL_API_CONNECT_OPTIONS,
-    ):
-        if not stt_list:
-            raise ValueError("You must provide at least one STT instance.")
-        self._stt_list = stt_list
-        self._conn_options = conn_options
+        stt: list[STT],
+        *,
+        attempt_timeout: float = 10.0,
+        max_retry_per_stt: int = 1,
+        retry_interval: float = 5,
+    ) -> None:
+        if len(stt) < 1:
+            raise ValueError("At least one STT instance must be provided.")
 
-        # Aggregate capabilities: for parallel usage, we typically need them all to be streaming.
-        can_stream = all(stt.capabilities.streaming for stt in stt_list)
-        can_interim = all(stt.capabilities.interim_results for stt in stt_list)
-
+        # We require that *all* STT have streaming if we want streaming fallback:
         super().__init__(
             capabilities=STTCapabilities(
-                streaming=can_stream, interim_results=can_interim
+                streaming=all(t.capabilities.streaming for t in stt),
+                interim_results=all(t.capabilities.interim_results for t in stt),
             )
         )
+
+        self._stt_instances = stt
+        self._attempt_timeout = attempt_timeout
+        self._max_retry_per_stt = max_retry_per_stt
+        self._retry_interval = retry_interval
+
+        self._status: list[_STTStatus] = [
+            _STTStatus(
+                available=True,
+                recovering_synthesize_task=None,
+                recovering_stream_task=None,
+            )
+            for _ in self._stt_instances
+        ]
+
+    async def _try_recognize(
+        self,
+        *,
+        stt: STT,
+        buffer: utils.AudioBuffer,
+        language: str | None = None,
+        conn_options: APIConnectOptions,
+        recovering: bool = False,
+    ) -> SpeechEvent:
+        """
+        Performs a single STT's recognize() call with the given buffer.
+        """
+        try:
+            return await stt.recognize(
+                buffer,
+                language=language,
+                conn_options=dataclasses.replace(
+                    conn_options,
+                    max_retry=self._max_retry_per_stt,
+                    timeout=self._attempt_timeout,
+                    retry_interval=self._retry_interval,
+                ),
+            )
+        except asyncio.TimeoutError:
+            if recovering:
+                logger.warning(
+                    f"{stt.label} recovery timed out", extra={"streamed": False}
+                )
+                raise
+
+            logger.warning(
+                f"{stt.label} timed out, switching to next STT",
+                extra={"streamed": False},
+            )
+            raise
+        except APIError as e:
+            if recovering:
+                logger.warning(
+                    f"{stt.label} recovery failed",
+                    exc_info=e,
+                    extra={"streamed": False},
+                )
+                raise
+
+            logger.warning(
+                f"{stt.label} failed, switching to next STT",
+                exc_info=e,
+                extra={"streamed": False},
+            )
+            raise
+        except Exception:
+            if recovering:
+                logger.exception(
+                    f"{stt.label} recovery unexpected error", extra={"streamed": False}
+                )
+                raise
+
+            logger.exception(
+                f"{stt.label} unexpected error, switching to next STT",
+                extra={"streamed": False},
+            )
+            raise
+
+    def _try_recovery(
+        self,
+        *,
+        stt: STT,
+        buffer: utils.AudioBuffer,
+        language: str | None,
+        conn_options: APIConnectOptions,
+    ) -> None:
+        """
+        Attempts to recover an STT that just failed, by spawning a background recognize
+        task with the same data. If that recovers successfully, we mark it as available again.
+        """
+        stt_status = self._status[self._stt_instances.index(stt)]
+        if (
+            stt_status.recovering_synthesize_task is None
+            or stt_status.recovering_synthesize_task.done()
+        ):
+
+            async def _recover_stt_task(stt: STT) -> None:
+                try:
+                    await self._try_recognize(
+                        stt=stt,
+                        buffer=buffer,
+                        language=language,
+                        conn_options=conn_options,
+                        recovering=True,
+                    )
+                    # If the above doesn't raise, we can mark STT as recovered
+                    stt_status.available = True
+                    logger.info(f"{stt.label} recovered")
+                    self.emit(
+                        "stt_availability_changed",
+                        AvailabilityChangedEvent(stt=stt, available=True),
+                    )
+                except Exception:
+                    # If we still fail, remain unavailable
+                    return
+
+            stt_status.recovering_synthesize_task = asyncio.create_task(
+                _recover_stt_task(stt)
+            )
+
+    async def _recognize_impl(
+        self,
+        buffer: utils.AudioBuffer,
+        *,
+        language: str | None,
+        conn_options: APIConnectOptions,
+    ) -> SpeechEvent:
+        """
+        Launches *all* STT in parallel. Then picks the final transcript
+        in priority order. If the highest priority that has a non-empty transcript
+        is found, we return that. Otherwise keep going. If all are empty or fail,
+        raise APIConnectionError.
+        """
+
+        start_time = time.time()
+        statuses = self._status
+
+        # If all are unavailable, we'll still attempt them to see if they recover:
+        all_failed_before = all(not s.available for s in statuses)
+        if all_failed_before:
+            logger.error("all STTs are unavailable, retrying..")
+
+        # STEP 1: Create tasks for each STT that is "available" or if all were failed (we try anyway).
+        tasks = []
+        stts_involved = []
+        for i, stt in enumerate(self._stt_instances):
+            stt_status = statuses[i]
+            if stt_status.available or all_failed_before:
+                # We try it in parallel
+                task = asyncio.create_task(
+                    self._try_recognize(
+                        stt=stt,
+                        buffer=buffer,
+                        language=language,
+                        conn_options=conn_options,
+                        recovering=False,
+                    )
+                )
+                tasks.append(task)
+                stts_involved.append(i)
+            else:
+                # We'll attempt to spawn a recovery in background
+                self._try_recovery(
+                    stt=stt, buffer=buffer, language=language, conn_options=conn_options
+                )
+
+        # If we have no tasks at all to run, then everything is unavailable and can't even be tried
+        if not tasks:
+            raise APIConnectionError(
+                "all STTs are permanently unavailable, cannot proceed."
+            )
+
+        # STEP 2: Gather results (some may fail with exceptions)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # STEP 3: Evaluate results in *priority order*. That means we check stts_involved
+        # in ascending order, which matches the order in which they appear in self._stt_instances.
+        # The first non-empty transcript we get from the highest priority is returned.
+        best_event = None
+        best_index = None
+
+        for idx, res in zip(stts_involved, results):
+            stt = self._stt_instances[idx]
+            if isinstance(res, Exception):
+                # Mark STT as unavailable, start recovery, skip
+                if statuses[idx].available:
+                    statuses[idx].available = False
+                    self.emit(
+                        "stt_availability_changed",
+                        AvailabilityChangedEvent(stt=stt, available=False),
+                    )
+                # Attempt recovery in background
+                self._try_recovery(
+                    stt=stt, buffer=buffer, language=language, conn_options=conn_options
+                )
+                continue
+
+            # If we got a successful SpeechEvent, check if it has text
+            event = res  # type: SpeechEvent
+            # Here you can define "non-empty" however you wish:
+            if event.alternatives and event.alternatives[0].text.strip():
+                # We'll pick the first (highest priority) that has text
+                best_event = event
+                best_index = idx
+                break
+            else:
+                # The STT responded but it's empty, so we treat that as a "failure" for fallback
+                if statuses[idx].available:
+                    statuses[idx].available = False
+                    self.emit(
+                        "stt_availability_changed",
+                        AvailabilityChangedEvent(stt=stt, available=False),
+                    )
+                self._try_recovery(
+                    stt=stt, buffer=buffer, language=language, conn_options=conn_options
+                )
+
+        if best_event is None:
+            # No STT returned anything non-empty
+            raise APIConnectionError(
+                "All STTs returned empty or failed (%s) after %.2f seconds"
+                % (
+                    [stt.label for stt in self._stt_instances],
+                    time.time() - start_time,
+                )
+            )
+
+        return best_event
 
     async def recognize(
         self,
         buffer: AudioBuffer,
         *,
-        language: Optional[str] = None,
-        conn_options: Optional[APIConnectOptions] = None,
+        language: str | None = None,
+        conn_options: APIConnectOptions = DEFAULT_FALLBACK_API_CONNECT_OPTIONS,
     ) -> SpeechEvent:
-        """
-        Non-streaming fallback: feed the same buffer to each STT in parallel,
-        collect results, pick the first non-empty final in priority order.
-        """
-        if conn_options is None:
-            conn_options = self._conn_options
-
-        start_time = time.time()
-
-        # Kick off .recognize() on all STTs in parallel
-        tasks = []
-        for i, stt in enumerate(self._stt_list):
-            t = asyncio.create_task(
-                self._recognize_one_stt(i, stt, buffer, language, conn_options)
-            )
-            tasks.append(t)
-
-        done, _pending = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
-
-        # Gather results
-        results_map: dict[int, SpeechEvent] = {}
-        errors_map: dict[int, Exception] = {}
-
-        for t in done:
-            stt_index, result_or_exc = t.result()
-            if isinstance(result_or_exc, Exception):
-                errors_map[stt_index] = result_or_exc
-            else:
-                results_map[stt_index] = result_or_exc
-
-        # Evaluate in priority order
-        final_event = self._pick_result_in_priority_order(results_map, errors_map)
-        if not final_event:
-            stt_labels = [stt.label for stt in self._stt_list]
-            raise APIConnectionError(
-                f"All STTs either failed or produced empty transcript ({stt_labels}) "
-                f"after {time.time() - start_time:.1f}s"
-            )
-
-        return final_event
-
-    async def _recognize_one_stt(
-        self,
-        idx: int,
-        stt: STT,
-        buffer: AudioBuffer,
-        language: Optional[str],
-        conn_options: APIConnectOptions,
-    ):
-        """
-        Calls stt.recognize() -> returns (index, SpeechEvent or Exception).
-        """
-        try:
-            ev = await stt.recognize(
-                buffer, language=language, conn_options=conn_options
-            )
-            return (idx, ev)
-        except Exception as e:
-            return (idx, e)
+        # The public-facing method
+        return await super().recognize(
+            buffer, language=language, conn_options=conn_options
+        )
 
     def stream(
         self,
         *,
-        language: Optional[str] = None,
-        conn_options: Optional[APIConnectOptions] = None,
+        language: str | None = None,
+        conn_options: APIConnectOptions = DEFAULT_FALLBACK_API_CONNECT_OPTIONS,
     ) -> RecognizeStream:
-        """
-        Parallel fallback streaming aggregator. We'll feed frames to all STTs at once,
-        and pick the first non-empty final in priority order.
-        """
-        if conn_options is None:
-            conn_options = self._conn_options
-
-        return ParallelFallbackRecognizeStream(
-            stt_list=self._stt_list,
-            parent_stt=self,
-            language=language,
-            conn_options=conn_options,
+        return FallbackRecognizeStream(
+            stt=self, language=language, conn_options=conn_options
         )
 
     async def aclose(self) -> None:
-        """
-        If your pipeline calls aclose() on this STT, forward to each child STT.
-        """
-        for stt in self._stt_list:
-            with contextlib.suppress(Exception):
-                await stt.aclose()
-
-    def _pick_result_in_priority_order(
-        self,
-        results_map: dict[int, SpeechEvent],
-        errors_map: dict[int, Exception],
-    ) -> Optional[SpeechEvent]:
-        """
-        Among all STTs that produced a final transcript, pick the first STT (index order)
-        that yields a non-empty final transcript.
-        """
-        for idx in range(len(self._stt_list)):
-            if idx in results_map:
-                ev = results_map[idx]
-                if ev.alternatives and ev.alternatives[0].text.strip():
-                    return ev
-                # else empty => check next STT
-            # if error or no entry => skip
-        return None
+        # Cancel any background recovery tasks
+        for stt_status in self._status:
+            if stt_status.recovering_synthesize_task is not None:
+                await aio.gracefully_cancel(stt_status.recovering_synthesize_task)
+            if stt_status.recovering_stream_task is not None:
+                await aio.gracefully_cancel(stt_status.recovering_stream_task)
 
 
-class ParallelFallbackRecognizeStream(RecognizeStream):
+class FallbackRecognizeStream(RecognizeStream):
     """
-    Streaming aggregator:
-      - Creates a sub-stream for each STT in self._stt_list
-      - Feeds audio frames to all
-      - Collects final transcript events
-      - As soon as the primary STT (index 0) yields a non-empty final -> finalize
-      - If primary is empty or fails -> see if the next STT yields a non-empty final, etc.
+    Parallel streaming version. We open multiple streams in parallel, and
+    feed audio frames to all of them. We capture whichever results come in.
+    Once we see a non-empty final transcript from the highest priority STT
+    that eventually yields results, we use it.
+
+    If multiple STTs finish, we prefer the top of the list (self._stt_instances[0]),
+    then the next, etc. If they are empty or fail, we fallback further.
     """
 
     def __init__(
         self,
-        stt_list: List[STT],
-        parent_stt: ParallelFallbackSTT,
-        language: Optional[str],
+        *,
+        stt: FallbackAdapter,
+        language: str | None,
         conn_options: APIConnectOptions,
     ):
-        super().__init__(stt=parent_stt, conn_options=conn_options, sample_rate=None)
+        super().__init__(stt=stt, conn_options=conn_options, sample_rate=None)
         self._language = language
-        self._stt_list = stt_list
-
-        # We'll create sub-streams for each STT in parallel
-        self._sub_streams: List[RecognizeStream] = []
-        # Final transcripts from each STT
-        self._final_events: dict[int, SpeechEvent] = {}
-        self._errors: dict[int, Exception] = {}
-        # Event to indicate we can finalize
-        self._done = asyncio.Event()
+        self._fallback_adapter = stt
+        self._recovering_streams: list[RecognizeStream] = []
 
     async def _run(self) -> None:
         start_time = time.time()
 
-        # 1) Create sub-streams
-        for stt in self._stt_list:
-            s = stt.stream(language=self._language, conn_options=self._conn_options)
-            self._sub_streams.append(s)
+        # If all STTs are unavailable, we still attempt them (they may recover)
+        statuses = self._fallback_adapter._status
+        all_failed_before = all(not s.available for s in statuses)
+        if all_failed_before:
+            logger.error("all STTs are unavailable, retrying..")
 
-        # 2) Start reading from each sub-stream in parallel
-        read_tasks = []
-        for idx, s in enumerate(self._sub_streams):
-            t = asyncio.create_task(self._read_sub_stream(idx, s))
-            read_tasks.append(t)
+        # Create parallel streams for those that are available (or if all unavailable, for all).
+        active_streams = []
+        stt_indices = []
+        for i, stt in enumerate(self._fallback_adapter._stt_instances):
+            stt_status = statuses[i]
+            if stt_status.available or all_failed_before:
+                stream = stt.stream(
+                    language=self._language,
+                    conn_options=dataclasses.replace(
+                        self._conn_options,
+                        max_retry=self._fallback_adapter._max_retry_per_stt,
+                        timeout=self._fallback_adapter._attempt_timeout,
+                        retry_interval=self._fallback_adapter._retry_interval,
+                    ),
+                )
+                active_streams.append(stream)
+                stt_indices.append(i)
+            else:
+                self._try_recovery(stt)
 
-        # 3) Forward audio frames from self._input_ch to each sub-stream
-        forward_task = asyncio.create_task(self._forward_input())
-
-        # 4) Wait for either:
-        #    - self._done to be set (meaning we decided on a final result),
-        #    - or for all read tasks to complete (meaning no one gave a good final).
-        done_set, pending = await asyncio.wait(
-            [self._done.wait(), *read_tasks],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        # If self._done is set, we have a final => cancel reading tasks
-        if self._done.is_set():
-            for t in read_tasks:
-                if not t.done():
-                    t.cancel()
-        else:
-            # All read tasks finished but we never finalized => no STT gave a non-empty final
-            self._done.set()
-
-        # Cancel forward input
-        forward_task.cancel()
-        await asyncio.gather(*read_tasks, return_exceptions=True)
-        await aio.gracefully_cancel(forward_task)
-
-        # 5) Pick final result in priority order
-        final_event = self._pick_result_in_priority_order()
-        if not final_event:
-            stt_labels = [stt.label for stt in self._stt_list]
+        if not active_streams:
             raise APIConnectionError(
-                f"All STTs ended but produced empty/fail: {stt_labels}, "
-                f"after {time.time() - start_time:.1f}s"
+                "all STTs are permanently unavailable, cannot stream"
             )
 
-        # 6) Emit the final transcript
-        self._event_ch.send_nowait(final_event)
+        # We'll push input to all active streams. Meanwhile, we read from them
+        # in parallel. We'll store final transcripts, track whichever highest priority
+        # STT yields a valid final transcript.
+        forward_input_task = asyncio.create_task(
+            self._forward_input_to_streams(active_streams)
+        )
 
-    async def _read_sub_stream(self, idx: int, sub_stream: RecognizeStream) -> None:
-        """
-        Read events from a single sub-stream, gather a final transcript if any.
-        If the primary STT yields a non-empty final, we can finalize immediately.
-        """
-        try:
-            async with sub_stream:
-                async for event in sub_stream:
-                    # If you want to forward interim from the primary only, you can do:
-                    # if idx == 0 and event.type == SpeechEventType.INTERIM_TRANSCRIPT:
-                    #     self._event_ch.send_nowait(event)
+        # We'll gather consumption tasks. We'll read from each stream concurrently, storing
+        # final transcripts or exceptions
+        consumption_tasks = [
+            asyncio.create_task(self._consume_stream(i, s))
+            for i, s in zip(stt_indices, active_streams)
+        ]
 
-                    if event.type == SpeechEventType.FINAL_TRANSCRIPT:
-                        self._final_events[idx] = event
-                        # If this is the primary STT (idx=0) and text is non-empty => finalize
-                        if (
-                            idx == 0
-                            and event.alternatives
-                            and event.alternatives[0].text.strip()
-                        ):
-                            self._done.set()
-                            return
-        except Exception as e:
-            self._errors[idx] = e
+        done, pending = await asyncio.wait(
+            consumption_tasks,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        # As soon as one finishes, we check if it got a non-empty final transcript.
+        # However, that finishing task might just have ended because of an error or
+        # an empty transcript. We'll then keep waiting for others, but we do it in
+        # multiple steps.
 
-    async def _forward_input(self) -> None:
+        # We'll do a loop until all tasks are done or we found a best result:
+        best_event = None
+        best_index = None
+
+        # Because we want the highest priority that yields a final transcript, we
+        # have to gather *all* tasks' results, but in a loop we can check partial completions.
+        # We'll forcibly wait for all tasks to finish, then pick the best result
+        # in priority order.
+        await asyncio.wait(consumption_tasks, return_when=asyncio.ALL_COMPLETED)
+
+        # Cancel the forward_input_task now that we don't need to push audio further
+        if not forward_input_task.done():
+            await aio.gracefully_cancel(forward_input_task)
+
+        # Check each consumption task
+        consumption_results = []
+        for idx, task in zip(stt_indices, consumption_tasks):
+            stt = self._fallback_adapter._stt_instances[idx]
+            if task.done():
+                res = task.result()
+                # res is either (SpeechEvent | Exception | None or a list)
+                consumption_results.append((idx, res))
+            else:
+                # Should not happen if ALL_COMPLETED, but just in case
+                task.cancel()
+                consumption_results.append((idx, None))
+
+        # Now pick in ascending priority order
+        for idx, result in consumption_results:
+            stt = self._fallback_adapter._stt_instances[idx]
+
+            if isinstance(result, Exception):
+                # The stream died with an error
+                if statuses[idx].available:
+                    statuses[idx].available = False
+                    self._fallback_adapter.emit(
+                        "stt_availability_changed",
+                        AvailabilityChangedEvent(stt=stt, available=False),
+                    )
+                self._try_recovery(stt)
+                continue
+
+            if not result:
+                # Could be None or empty
+                if statuses[idx].available:
+                    statuses[idx].available = False
+                    self._fallback_adapter.emit(
+                        "stt_availability_changed",
+                        AvailabilityChangedEvent(stt=stt, available=False),
+                    )
+                self._try_recovery(stt)
+                continue
+
+            # We stored final transcripts in a list or returned the best event
+            # If the result is a non-empty SpeechEvent, we check it:
+            event = result
+            if isinstance(event, SpeechEvent):
+                if event.alternatives and event.alternatives[0].text.strip():
+                    best_event = event
+                    best_index = idx
+                    break
+                else:
+                    if statuses[idx].available:
+                        statuses[idx].available = False
+                        self._fallback_adapter.emit(
+                            "stt_availability_changed",
+                            AvailabilityChangedEvent(stt=stt, available=False),
+                        )
+                    self._try_recovery(stt)
+            else:
+                # If your _consume_stream returns something else, handle accordingly
+                pass
+
+        # If none is found:
+        if best_event is None:
+            # All STTs gave nothing or errored
+            raise APIConnectionError(
+                "all STTs failed or returned empty (%s) after %.2f seconds"
+                % (
+                    [stt.label for stt in self._fallback_adapter._stt_instances],
+                    time.time() - start_time,
+                )
+            )
+
+        # If we do have a best event, we forward that to the user
+        self._event_ch.send_nowait(best_event)
+
+    async def _forward_input_to_streams(self, streams: list[RecognizeStream]) -> None:
         """
-        Push audio frames from self._input_ch to all sub-streams.
+        Reads from self._input_ch and forwards audio frames to each stream in parallel.
         """
-        try:
+        with contextlib.suppress(RuntimeError):
             async for data in self._input_ch:
-                for s in self._sub_streams:
+                for stream in streams:
                     if isinstance(data, rtc.AudioFrame):
-                        s.push_frame(data)
-                    else:
-                        s.flush()
-        finally:
-            # Signal no more data
-            for s in self._sub_streams:
-                with contextlib.suppress(Exception):
-                    s.end_input()
+                        stream.push_frame(data)
+                    elif isinstance(data, self._FlushSentinel):
+                        stream.flush()
+            for stream in streams:
+                stream.end_input()
 
-    def _pick_result_in_priority_order(self) -> Optional[SpeechEvent]:
+    async def _consume_stream(self, idx: int, stream: RecognizeStream):
         """
-        Among the final transcripts we have, pick the first non-empty in index order.
+        Collects events from the given stream. If we get a final transcript event
+        with non-empty text, we return that. If the stream ends, we return the
+        *last* final transcript or None. Raises on errors.
         """
-        for idx in range(len(self._stt_list)):
-            if idx in self._errors:
-                continue
-            if idx not in self._final_events:
-                continue
-            event = self._final_events[idx]
-            if event.alternatives and event.alternatives[0].text.strip():
-                return event
-        return None
+        stt = self._fallback_adapter._stt_instances[idx]
+        try:
+            async with stream:
+                async for ev in stream:
+                    # Forward *all* events up the chain if you wish
+                    self._event_ch.send_nowait(ev)
+
+                    # If a final transcript has text, we can either immediately
+                    # return it, or accumulate. Here, we'll just return on the
+                    # first non-empty final. That ensures *this* consumption
+                    # finishes quickly.
+                    if ev.type in SpeechEventType.FINAL_TRANSCRIPT:
+                        if ev.alternatives and ev.alternatives[0].text.strip():
+                            return ev
+            # If the stream ended normally but no final transcript with text
+            return None
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"{stt.label} timed out in streaming, switching to next STT",
+                extra={"streamed": True},
+            )
+            raise
+        except APIError as e:
+            logger.warning(
+                f"{stt.label} failed in streaming, switching to next STT",
+                exc_info=e,
+                extra={"streamed": True},
+            )
+            raise
+        except Exception:
+            logger.exception(
+                f"{stt.label} unexpected error in streaming, switching to next STT",
+                extra={"streamed": True},
+            )
+            raise
+
+    def _try_recovery(self, stt: STT) -> None:
+        """
+        Launch a "recovery" streaming task in the background. If it sees
+        a final transcript, we mark STT as recovered.
+        """
+        stt_status = self._fallback_adapter._status[
+            self._fallback_adapter._stt_instances.index(stt)
+        ]
+        if (
+            stt_status.recovering_stream_task is None
+            or stt_status.recovering_stream_task.done()
+        ):
+            # We open a zero-retry stream with the same adapter
+            stream = stt.stream(
+                language=self._language,
+                conn_options=dataclasses.replace(
+                    self._conn_options,
+                    max_retry=0,
+                    timeout=self._fallback_adapter._attempt_timeout,
+                ),
+            )
+            self._recovering_streams.append(stream)
+
+            async def _recover_stt_task() -> None:
+                try:
+                    nb_transcript = 0
+                    async with stream:
+                        async for ev in stream:
+                            if ev.type in SpeechEventType.FINAL_TRANSCRIPT:
+                                if ev.alternatives and ev.alternatives[0].text.strip():
+                                    nb_transcript += 1
+                                    break
+
+                    if nb_transcript == 0:
+                        return
+
+                    # If we get at least one final transcript with text, we call that "recovered"
+                    stt_status.available = True
+                    logger.info(f"tts.FallbackAdapter, {stt.label} recovered")
+                    self._fallback_adapter.emit(
+                        "stt_availability_changed",
+                        AvailabilityChangedEvent(stt=stt, available=True),
+                    )
+
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"{stream._stt.label} recovery timed out",
+                        extra={"streamed": True},
+                    )
+                except APIError as e:
+                    logger.warning(
+                        f"{stream._stt.label} recovery failed",
+                        exc_info=e,
+                        extra={"streamed": True},
+                    )
+                except Exception:
+                    logger.exception(
+                        f"{stream._stt.label} recovery unexpected error",
+                        extra={"streamed": True},
+                    )
+
+            stt_status.recovering_stream_task = task = asyncio.create_task(
+                _recover_stt_task()
+            )
+
+            # Remove from _recovering_streams when done
+            def _remove_on_done(_):
+                if stream in self._recovering_streams:
+                    self._recovering_streams.remove(stream)
+
+            task.add_done_callback(_remove_on_done)

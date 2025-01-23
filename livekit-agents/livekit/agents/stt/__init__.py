@@ -11,7 +11,7 @@ from .stt import (
     STTCapabilities,
 )
 from .fallback import FallbackSTT
-from .parallel_fallback_adapter import ParallelFallbackSTT
+from .parallel_fallback_adapter import ParallelFallbackAdapter
 
 __all__ = [
     "SpeechEventType",

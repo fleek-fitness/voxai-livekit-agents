@@ -145,3 +145,87 @@ class FallbackSTT(StreamAdapter):
     async def aclose(self):
         """Close both STT providers."""
         await asyncio.gather(self._primary.aclose(), self._secondary.aclose())
+
+    async def _recognize_impl(
+        self,
+        buffer: AudioBuffer,
+        *,
+        language: Optional[str] = None,
+        conn_options: Optional[APIConnectOptions] = None,
+    ) -> SpeechEvent:
+        """
+        Non-streaming recognition implementation that runs both STT providers in parallel
+        and returns the first non-empty result, preferring primary when both succeed.
+        """
+        if conn_options is None:
+            conn_options = DEFAULT_API_CONNECT_OPTIONS
+
+        # Run both recognizers in parallel
+        primary_task = asyncio.create_task(
+            self._primary.recognize(
+                buffer, language=language, conn_options=conn_options
+            )
+        )
+        secondary_task = asyncio.create_task(
+            self._secondary.recognize(
+                buffer, language=language, conn_options=conn_options
+            )
+        )
+
+        # Wait for both tasks to complete
+        done, pending = await asyncio.wait(
+            [primary_task, secondary_task], return_when=asyncio.ALL_COMPLETED
+        )
+
+        # Cancel any pending tasks (shouldn't happen since we waited for ALL_COMPLETED)
+        for task in pending:
+            task.cancel()
+
+        primary_result = None
+        secondary_result = None
+        primary_error = None
+
+        # Get primary result or error
+        try:
+            primary_result = primary_task.result()
+        except Exception as e:
+            primary_error = e
+            logger.warning("Primary STT failed", exc_info=e)
+
+        # Check primary result first if available
+        if (
+            primary_result
+            and primary_result.alternatives
+            and primary_result.alternatives[0].text.strip()
+        ):
+            logger.debug(
+                "Using primary STT result",
+                extra={"text": primary_result.alternatives[0].text},
+            )
+            return primary_result
+
+        # Get secondary result
+        try:
+            secondary_result = secondary_task.result()
+        except Exception as e:
+            logger.warning("Secondary STT failed", exc_info=e)
+            if primary_error:  # If both failed, raise the primary error
+                raise primary_error
+            raise
+
+        # If secondary has content, use it
+        if (
+            secondary_result
+            and secondary_result.alternatives
+            and secondary_result.alternatives[0].text.strip()
+        ):
+            logger.debug(
+                "Using secondary STT result (primary empty or failed)",
+                extra={"text": secondary_result.alternatives[0].text},
+            )
+            return secondary_result
+
+        # If we get here, neither provider produced usable results
+        raise APIConnectionError(
+            "Both STT providers failed to produce non-empty results"
+        )
