@@ -26,29 +26,31 @@ from . import nest_pb2_grpc
 
 logger = logging.getLogger(__name__)
 
-# Change port from 443 to 50051 as per Clova docs
+# Optimized constants for lower latency
 CLOVA_SERVER_URL = "clovaspeech-gw.ncloud.com:50051"
+CLOVA_SAMPLE_RATE = 16000
+CLOVA_BITS_PER_SAMPLE = 16
+CLOVA_CHANNELS = 1
+CLOVA_CHUNK_SIZE = 4096  # Reduced from 32000 to 4KB for lower latency
+STREAM_TIMEOUT = 60.0  # Reduced from 300s to 60s
 
 DEFAULT_API_CONNECT_OPTIONS = APIConnectOptions()
-
-# Audio format requirements from Clova docs
-CLOVA_SAMPLE_RATE = 16000  # 16kHz required
-CLOVA_BITS_PER_SAMPLE = 16  # 16 bits per sample required
-CLOVA_CHANNELS = 1  # 1 channel required
-CLOVA_CHUNK_SIZE = 32000  # From Clova example
 
 
 @dataclass
 class ClovaSTTConfig:
-    """Configuration for Clova STT following their docs."""
+    """Configuration for Clova STT with optimized settings for low latency."""
 
     language: str = "ko"
-    keyword_boosting: Optional[List[dict]] = (
-        None  # [{"words": "word1,word2", "weight": 1.0}]
-    )
-    forbidden_words: Optional[List[str]] = None  # ["word1", "word2"]
-    semantic_epd: Optional[dict] = (
-        None  # {"skipEmptyText": bool, "useWordEpd": bool, ...}
+    keyword_boosting: Optional[List[dict]] = None
+    forbidden_words: Optional[List[str]] = None
+    semantic_epd: Optional[dict] = dataclasses.field(
+        default_factory=lambda: {
+            "useWordEpd": True,
+            "usePeriodEpd": True,
+            "gapThreshold": 300,
+            "skipEmptyText": True,
+        }
     )
     sample_rate: int = CLOVA_SAMPLE_RATE
     bits_per_sample: int = CLOVA_BITS_PER_SAMPLE
@@ -176,6 +178,34 @@ class ClovaSpeechStream(stt.SpeechStream):
         self._speech_start_time = None
         self._reconnect_event = asyncio.Event()
 
+        # Pre-compute config for faster startup
+        self._config_json = json.dumps(
+            {
+                "transcription": {"language": self._config.language},
+                "semanticEpd": self._config.semantic_epd
+                or {
+                    "useWordEpd": True,
+                    "usePeriodEpd": True,
+                    "gapThreshold": 300,
+                    "skipEmptyText": True,
+                },
+                **(
+                    {"keywordBoosting": {"boostings": self._config.keyword_boosting}}
+                    if self._config.keyword_boosting
+                    else {}
+                ),
+                **(
+                    {"forbidden": {"forbiddens": self._config.forbidden_words}}
+                    if self._config.forbidden_words
+                    else {}
+                ),
+            }
+        )
+
+        # Pre-create request templates
+        self._data_request = nest_pb2.NestRequest(type=nest_pb2.RequestType.DATA)
+        self._data_request.data.CopyFrom(nest_pb2.NestData())
+
     def update_options(
         self,
         *,
@@ -192,10 +222,78 @@ class ClovaSpeechStream(stt.SpeechStream):
             self._closed = True
             try:
                 if self._input_ch:
-                    self._input_ch.close()
+                    await self._input_ch.aclose()
                 await asyncio.sleep(0)  # let tasks drain
             finally:
                 await super().close()
+
+    async def request_iterator(self):
+        try:
+            # 1) Send initial config
+            yield nest_pb2.NestRequest(
+                type=nest_pb2.RequestType.CONFIG,
+                config=nest_pb2.NestConfig(config=self._config_json),
+            )
+
+            # 2) Process frames immediately as they arrive
+            seq_id = 0
+            while not self._closed:
+                try:
+                    # No timeout - process frames as they come
+                    frame = await self._input_ch.arecv()
+                    if frame is None:
+                        break
+
+                    if not isinstance(frame, rtc.AudioFrame):
+                        continue
+
+                    # Split large frames into smaller chunks for lower latency
+                    data = frame.data.tobytes()
+                    for i in range(0, len(data), CLOVA_CHUNK_SIZE):
+                        chunk = data[i : i + CLOVA_CHUNK_SIZE]
+                        seq_id += 1
+
+                        # Reuse request object for better performance
+                        self._data_request.data.chunk = chunk
+                        self._data_request.data.extra_contents = json.dumps(
+                            {"seqId": seq_id, "epFlag": False}
+                        )
+                        yield self._data_request
+
+                except asyncio.CancelledError:
+                    logger.debug("Stream cancelled")
+                    break
+                except Exception as e:
+                    logger.error(f"Error processing frame: {e}")
+                    break
+
+            # 3) Send final chunk with epFlag to flush
+            if seq_id > 0:
+                self._data_request.data.chunk = b""
+                self._data_request.data.extra_contents = json.dumps(
+                    {"seqId": seq_id + 1, "epFlag": True}
+                )
+                yield self._data_request
+
+        finally:
+            if not self._closed:
+                await self.close()
+
+    def push_frame(self, frame: rtc.AudioFrame) -> None:
+        """Optimized frame pushing with minimal processing"""
+        if self._closed:
+            return
+
+        # Only convert if absolutely necessary
+        if (
+            frame.sample_rate != CLOVA_SAMPLE_RATE
+            or frame.num_channels != CLOVA_CHANNELS
+        ):
+            frame = frame.remix_and_resample(
+                sample_rate=CLOVA_SAMPLE_RATE, num_channels=CLOVA_CHANNELS
+            )
+
+        super().push_frame(frame)
 
     async def _run(self) -> None:
         """
