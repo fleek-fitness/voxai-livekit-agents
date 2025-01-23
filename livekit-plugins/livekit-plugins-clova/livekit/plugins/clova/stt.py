@@ -79,10 +79,18 @@ class STT(stt.STT):
         self._stub: nest_pb2_grpc.NestServiceStub | None = None
         self._streams = weakref.WeakSet()
 
-        # Create a gRPC channel once
+        # Create a gRPC channel with optimized settings
         self._channel = aio.secure_channel(
             CLOVA_SERVER_URL,
             credentials=grpc.ssl_channel_credentials(),
+            options=[
+                ("grpc.keepalive_time_ms", 30000),
+                ("grpc.keepalive_timeout_ms", 10000),
+                ("grpc.http2.min_time_between_pings_ms", 10000),
+                ("grpc.http2.max_pings_without_data", 0),
+                ("grpc.enable_retries", 0),
+                ("grpc.ssl_target_name_override", "clovaspeech-gw.ncloud.com"),
+            ],
         )
         # Create the stub
         self._stub = nest_pb2_grpc.NestServiceStub(self._channel)
