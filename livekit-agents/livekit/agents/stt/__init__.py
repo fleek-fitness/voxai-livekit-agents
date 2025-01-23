@@ -10,6 +10,7 @@ from .stt import (
     SpeechStream,
     STTCapabilities,
 )
+from .fallback import FallbackSTT
 
 __all__ = [
     "SpeechEventType",
@@ -24,4 +25,5 @@ __all__ = [
     "RecognitionUsage",
     "FallbackAdapter",
     "AvailabilityChangedEvent",
+    "FallbackSTT",
 ]
