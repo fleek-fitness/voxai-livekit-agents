@@ -83,7 +83,7 @@ class STT(stt.STT):
         self._default_timeout = default_timeout
 
         # Create gRPC channel with correct port and without ssl override
-        self._channel = aio.secure_channel(
+        self._channel = grpc.secure_channel(
             CLOVA_SERVER_URL,
             credentials=grpc.ssl_channel_credentials(),
             options=[
