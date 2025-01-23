@@ -83,16 +83,17 @@ class STT(stt.STT):
         self._streams = weakref.WeakSet()
         self._default_timeout = default_timeout
 
-        # Use async channel
+        # Use async channel with longer timeouts
         self._channel = aio.secure_channel(
             CLOVA_SERVER_URL,
             credentials=grpc.ssl_channel_credentials(),
             options=[
                 ("grpc.keepalive_time_ms", 30000),
-                ("grpc.keepalive_timeout_ms", 10000),
+                ("grpc.keepalive_timeout_ms", 20000),  # Increased from 10000
                 ("grpc.http2.min_time_between_pings_ms", 10000),
                 ("grpc.http2.max_pings_without_data", 0),
-                ("grpc.enable_retries", 0),
+                ("grpc.enable_retries", 1),  # Enable retries
+                ("grpc.max_receive_message_length", 10 * 1024 * 1024),  # 10MB
             ],
         )
         # Create stub
@@ -238,10 +239,16 @@ class ClovaSpeechStream(stt.SpeechStream):
 
                 # 2) Then read frames from the queue and yield DATA requests
                 seq_id = 0
+                last_activity = time.time()
                 while not self._closed:
                     try:
-                        # Use async receive
-                        frame = await self._input_ch.recv()
+                        # Use async receive with timeout
+                        frame = await asyncio.wait_for(
+                            self._input_ch.recv(),
+                            timeout=30.0,  # 30 second timeout for receiving frames
+                        )
+                        last_activity = time.time()
+
                         if frame is None:
                             break
 
@@ -258,6 +265,17 @@ class ClovaSpeechStream(stt.SpeechStream):
                             ),
                         )
                         seq_id += 1
+
+                        # Check for inactivity timeout
+                        if (
+                            time.time() - last_activity > 60
+                        ):  # 60 second inactivity timeout
+                            logger.warning("Inactivity timeout reached, closing stream")
+                            break
+
+                    except asyncio.TimeoutError:
+                        logger.warning("Timeout waiting for audio frame")
+                        break
                     except Exception as e:
                         logger.error(f"Error processing frame: {e}")
                         break
@@ -273,7 +291,8 @@ class ClovaSpeechStream(stt.SpeechStream):
                             ),
                         ),
                     )
-            except Exception:
+            except Exception as e:
+                logger.error(f"Error in request iterator: {e}")
                 if not self._closed:
                     self._closed = True
                     if self._input_ch:
@@ -287,11 +306,11 @@ class ClovaSpeechStream(stt.SpeechStream):
             raise APIConnectionError("Clova stub not initialized")
 
         try:
-            # Remove await from recognize call
+            # Use a longer timeout for the gRPC call
             response_stream = stub.recognize(
                 request_iterator(),
                 metadata=metadata,
-                timeout=self._conn_options.timeout,
+                timeout=300.0,  # 5 minute timeout for the entire stream
             )
 
             # Use async for with response stream
