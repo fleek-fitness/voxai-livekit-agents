@@ -143,3 +143,13 @@ class FallbackSTT(STT):
     async def aclose(self):
         """Close both STT providers."""
         await asyncio.gather(self._primary.aclose(), self._secondary.aclose())
+
+    async def _recognize_impl(self, *args, **kwargs):
+        """
+        This implementation is not used since we delegate all recognition
+        to the primary and secondary providers.
+        """
+        raise NotImplementedError(
+            "FallbackSTT does not implement recognition directly - "
+            "it delegates to primary and secondary providers"
+        )
