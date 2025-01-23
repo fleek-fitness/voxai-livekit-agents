@@ -31,9 +31,8 @@ class FallbackSTT(STT):
     ):
         # Calculate capabilities before calling super().__init__()
         capabilities = STTCapabilities(
-            streaming=(
-                primary.capabilities.streaming and secondary.capabilities.streaming
-            )
+            streaming=(primary.capabilities.streaming),
+            interim_results=(primary.capabilities.interim_results),
         )
 
         # Pass capabilities to parent class
