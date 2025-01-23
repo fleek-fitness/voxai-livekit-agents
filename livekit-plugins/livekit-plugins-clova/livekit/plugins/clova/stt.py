@@ -284,14 +284,14 @@ class ClovaSpeechStream(stt.SpeechStream):
             raise APIConnectionError("Clova stub not initialized")
 
         try:
-            # Use async gRPC
-            response_stream = await stub.recognize(
+            # Remove await from recognize call
+            response_stream = stub.recognize(
                 request_iterator(),
                 metadata=metadata,
                 timeout=self._conn_options.timeout,
             )
 
-            # Use async for
+            # Use async for with response stream
             async for resp in response_stream:
                 raw_contents = resp.contents
                 # Rest of the processing remains the same
