@@ -36,7 +36,7 @@ class _STTStatus:
     recovering_stream_task: asyncio.Task | None
 
 
-class FallbackAdapter(
+class ParallelFallbackAdapter(
     STT[Literal["stt_availability_changed"]],
 ):
     """
@@ -342,7 +342,7 @@ class FallbackRecognizeStream(RecognizeStream):
     def __init__(
         self,
         *,
-        stt: FallbackAdapter,
+        stt: ParallelFallbackAdapter,
         language: str | None,
         conn_options: APIConnectOptions,
     ):
