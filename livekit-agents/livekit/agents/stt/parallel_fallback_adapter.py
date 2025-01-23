@@ -485,32 +485,36 @@ class FallbackRecognizeStream(RecognizeStream):
 
     async def _forward_input_to_streams(self, streams: list[RecognizeStream]) -> None:
         """Reads from self._input_ch and forwards audio frames to each stream in parallel."""
-        try:
+        with contextlib.suppress(RuntimeError):  # Suppress errors from closed streams
             async for data in self._input_ch:
-                # Check for inactivity timeout
-                if time.time() - self._last_activity_time > 30:  # 30 second timeout
-                    logger.warning("Stream inactive for too long, closing")
+                if self._is_closed:
                     break
 
+                # Update activity time for non-flush data
+                if isinstance(data, rtc.AudioFrame):
+                    self._last_activity_time = time.time()
+
+                active_streams = []
                 for stream in streams:
                     try:
                         if isinstance(data, rtc.AudioFrame):
                             stream.push_frame(data)
                         elif isinstance(data, self._FlushSentinel):
                             stream.flush()
+                        active_streams.append(stream)
                     except Exception as e:
                         logger.warning(f"Error forwarding data to stream: {e}")
-                        continue
 
-            # Only end input if we haven't timed out
-            if time.time() - self._last_activity_time <= 30:
+                # Update our active streams list
+                streams[:] = active_streams
+
+            # Try to end input for remaining streams
+            if not self._is_closed:
                 for stream in streams:
                     try:
                         stream.end_input()
                     except Exception:
                         pass
-        except Exception as e:
-            logger.warning(f"Error in forward input task: {e}")
 
     async def _consume_stream(self, idx: int, stream: RecognizeStream):
         """
@@ -525,12 +529,9 @@ class FallbackRecognizeStream(RecognizeStream):
                     if self._is_closed:
                         return None
 
-                    try:
+                    # Forward events with error suppression
+                    with contextlib.suppress(RuntimeError):
                         self._event_ch.send_nowait(ev)
-                    except Exception:
-                        if self._is_closed:
-                            return None
-                        raise
 
                     if ev.type in SpeechEventType.FINAL_TRANSCRIPT:
                         if ev.alternatives and ev.alternatives[0].text.strip():
@@ -541,7 +542,9 @@ class FallbackRecognizeStream(RecognizeStream):
                 f"{stt.label} timed out in streaming, switching to next STT",
                 extra={"streamed": True},
             )
-            raise
+            if not self._is_closed:
+                raise
+            return None
         except APIError as e:
             if isinstance(e, APIStatusError) and "Stream timed out" in str(e):
                 logger.warning(
@@ -554,7 +557,9 @@ class FallbackRecognizeStream(RecognizeStream):
                 exc_info=e,
                 extra={"streamed": True},
             )
-            raise
+            if not self._is_closed:
+                raise
+            return None
         except Exception as e:
             if self._is_closed:
                 return None
