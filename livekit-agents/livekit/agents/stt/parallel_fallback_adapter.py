@@ -11,7 +11,7 @@ from livekit import rtc
 from livekit.agents.utils.audio import AudioBuffer
 
 from .. import utils
-from .._exceptions import APIConnectionError, APIError, APIStatusError
+from .._exceptions import APIConnectionError, APIError
 from ..log import logger
 from ..types import DEFAULT_API_CONNECT_OPTIONS, APIConnectOptions
 from ..utils import aio
@@ -36,7 +36,7 @@ class _STTStatus:
     recovering_stream_task: asyncio.Task | None
 
 
-class ParallelFallbackAdapter(
+class FallbackAdapter(
     STT[Literal["stt_availability_changed"]],
 ):
     """
@@ -342,7 +342,7 @@ class FallbackRecognizeStream(RecognizeStream):
     def __init__(
         self,
         *,
-        stt: ParallelFallbackAdapter,
+        stt: FallbackAdapter,
         language: str | None,
         conn_options: APIConnectOptions,
     ):
@@ -350,171 +350,164 @@ class FallbackRecognizeStream(RecognizeStream):
         self._language = language
         self._fallback_adapter = stt
         self._recovering_streams: list[RecognizeStream] = []
-        self._active_streams: list[RecognizeStream] = []
-        self._forward_input_task: asyncio.Task | None = None
-        self._is_closed = False
-        self._last_activity_time = time.time()
-
-    def push_frame(self, frame: rtc.AudioFrame) -> None:
-        """Override push_frame to update activity timestamp"""
-        self._last_activity_time = time.time()
-        if not self._is_closed:
-            super().push_frame(frame)
-
-    async def _cleanup_streams(self) -> None:
-        """Clean up all active and recovery streams."""
-        self._is_closed = True
-
-        # Cancel forward input task if it exists
-        if self._forward_input_task and not self._forward_input_task.done():
-            await aio.gracefully_cancel(self._forward_input_task)
-            self._forward_input_task = None
-
-        # Close all active streams
-        for stream in self._active_streams:
-            try:
-                await stream.aclose()
-            except Exception:
-                pass
-        self._active_streams.clear()
-
-        # Close all recovery streams
-        for stream in self._recovering_streams:
-            try:
-                await stream.aclose()
-            except Exception:
-                pass
-        self._recovering_streams.clear()
-
-    async def aclose(self) -> None:
-        """Ensure proper cleanup when the stream is closed."""
-        await self._cleanup_streams()
-        await super().aclose()
 
     async def _run(self) -> None:
-        try:
-            start_time = time.time()
+        start_time = time.time()
 
-            # Clean up any existing streams before starting new ones
-            await self._cleanup_streams()
+        # If all STTs are unavailable, we still attempt them (they may recover)
+        statuses = self._fallback_adapter._status
+        all_failed_before = all(not s.available for s in statuses)
+        if all_failed_before:
+            logger.error("all STTs are unavailable, retrying..")
 
-            # If all STTs are unavailable, we still attempt them (they may recover)
-            statuses = self._fallback_adapter._status
-            all_failed_before = all(not s.available for s in statuses)
-            if all_failed_before:
-                logger.error("all STTs are unavailable, retrying..")
-
-            # Create parallel streams for those that are available
-            stt_indices = []
-            for i, stt in enumerate(self._fallback_adapter._stt_instances):
-                stt_status = statuses[i]
-                if stt_status.available or all_failed_before:
-                    stream = stt.stream(
-                        language=self._language,
-                        conn_options=dataclasses.replace(
-                            self._conn_options,
-                            max_retry=self._fallback_adapter._max_retry_per_stt,
-                            timeout=self._fallback_adapter._attempt_timeout,
-                            retry_interval=self._fallback_adapter._retry_interval,
-                        ),
-                    )
-                    self._active_streams.append(stream)
-                    stt_indices.append(i)
-                else:
-                    self._try_recovery(stt)
-
-            if not self._active_streams:
-                raise APIConnectionError(
-                    "all STTs are permanently unavailable, cannot stream"
+        # Create parallel streams for those that are available (or if all unavailable, for all).
+        active_streams = []
+        stt_indices = []
+        for i, stt in enumerate(self._fallback_adapter._stt_instances):
+            stt_status = statuses[i]
+            if stt_status.available or all_failed_before:
+                stream = stt.stream(
+                    language=self._language,
+                    conn_options=dataclasses.replace(
+                        self._conn_options,
+                        max_retry=self._fallback_adapter._max_retry_per_stt,
+                        timeout=self._fallback_adapter._attempt_timeout,
+                        retry_interval=self._fallback_adapter._retry_interval,
+                    ),
                 )
+                active_streams.append(stream)
+                stt_indices.append(i)
+            else:
+                self._try_recovery(stt)
 
-            # Start forwarding input to all streams
-            self._forward_input_task = asyncio.create_task(
-                self._forward_input_to_streams(self._active_streams)
+        if not active_streams:
+            raise APIConnectionError(
+                "all STTs are permanently unavailable, cannot stream"
             )
 
-            # Create consumption tasks
-            consumption_tasks = [
-                asyncio.create_task(self._consume_stream(i, s))
-                for i, s in zip(stt_indices, self._active_streams)
-            ]
+        # We'll push input to all active streams. Meanwhile, we read from them
+        # in parallel. We'll store final transcripts, track whichever highest priority
+        # STT yields a valid final transcript.
+        forward_input_task = asyncio.create_task(
+            self._forward_input_to_streams(active_streams)
+        )
 
-            # Wait for all tasks to complete
-            await asyncio.wait(consumption_tasks, return_when=asyncio.ALL_COMPLETED)
+        # We'll gather consumption tasks. We'll read from each stream concurrently, storing
+        # final transcripts or exceptions
+        consumption_tasks = [
+            asyncio.create_task(self._consume_stream(i, s))
+            for i, s in zip(stt_indices, active_streams)
+        ]
 
-            # Process results
-            best_event = None
-            best_index = None
+        done, pending = await asyncio.wait(
+            consumption_tasks,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        # As soon as one finishes, we check if it got a non-empty final transcript.
+        # However, that finishing task might just have ended because of an error or
+        # an empty transcript. We'll then keep waiting for others, but we do it in
+        # multiple steps.
 
-            for idx, task in zip(stt_indices, consumption_tasks):
-                stt = self._fallback_adapter._stt_instances[idx]
-                if task.done():
-                    try:
-                        result = task.result()
-                        if isinstance(result, SpeechEvent):
-                            if (
-                                result.alternatives
-                                and result.alternatives[0].text.strip()
-                            ):
-                                best_event = result
-                                best_index = idx
-                                break
-                    except Exception as e:
-                        if statuses[idx].available:
-                            statuses[idx].available = False
-                            self._fallback_adapter.emit(
-                                "stt_availability_changed",
-                                AvailabilityChangedEvent(stt=stt, available=False),
-                            )
-                        self._try_recovery(stt)
+        # We'll do a loop until all tasks are done or we found a best result:
+        best_event = None
+        best_index = None
 
-            if best_event is None:
-                raise APIConnectionError(
-                    "all STTs failed or returned empty (%s) after %.2f seconds"
-                    % (
-                        [stt.label for stt in self._fallback_adapter._stt_instances],
-                        time.time() - start_time,
+        # Because we want the highest priority that yields a final transcript, we
+        # have to gather *all* tasks' results, but in a loop we can check partial completions.
+        # We'll forcibly wait for all tasks to finish, then pick the best result
+        # in priority order.
+        await asyncio.wait(consumption_tasks, return_when=asyncio.ALL_COMPLETED)
+
+        # Cancel the forward_input_task now that we don't need to push audio further
+        if not forward_input_task.done():
+            await aio.gracefully_cancel(forward_input_task)
+
+        # Check each consumption task
+        consumption_results = []
+        for idx, task in zip(stt_indices, consumption_tasks):
+            stt = self._fallback_adapter._stt_instances[idx]
+            if task.done():
+                res = task.result()
+                # res is either (SpeechEvent | Exception | None or a list)
+                consumption_results.append((idx, res))
+            else:
+                # Should not happen if ALL_COMPLETED, but just in case
+                task.cancel()
+                consumption_results.append((idx, None))
+
+        # Now pick in ascending priority order
+        for idx, result in consumption_results:
+            stt = self._fallback_adapter._stt_instances[idx]
+
+            if isinstance(result, Exception):
+                # The stream died with an error
+                if statuses[idx].available:
+                    statuses[idx].available = False
+                    self._fallback_adapter.emit(
+                        "stt_availability_changed",
+                        AvailabilityChangedEvent(stt=stt, available=False),
                     )
+                self._try_recovery(stt)
+                continue
+
+            if not result:
+                # Could be None or empty
+                if statuses[idx].available:
+                    statuses[idx].available = False
+                    self._fallback_adapter.emit(
+                        "stt_availability_changed",
+                        AvailabilityChangedEvent(stt=stt, available=False),
+                    )
+                self._try_recovery(stt)
+                continue
+
+            # We stored final transcripts in a list or returned the best event
+            # If the result is a non-empty SpeechEvent, we check it:
+            event = result
+            if isinstance(event, SpeechEvent):
+                if event.alternatives and event.alternatives[0].text.strip():
+                    best_event = event
+                    best_index = idx
+                    break
+                else:
+                    if statuses[idx].available:
+                        statuses[idx].available = False
+                        self._fallback_adapter.emit(
+                            "stt_availability_changed",
+                            AvailabilityChangedEvent(stt=stt, available=False),
+                        )
+                    self._try_recovery(stt)
+            else:
+                # If your _consume_stream returns something else, handle accordingly
+                pass
+
+        # If none is found:
+        if best_event is None:
+            # All STTs gave nothing or errored
+            raise APIConnectionError(
+                "all STTs failed or returned empty (%s) after %.2f seconds"
+                % (
+                    [stt.label for stt in self._fallback_adapter._stt_instances],
+                    time.time() - start_time,
                 )
+            )
 
-            self._event_ch.send_nowait(best_event)
-
-        finally:
-            # Always clean up streams when done
-            await self._cleanup_streams()
+        # If we do have a best event, we forward that to the user
+        self._event_ch.send_nowait(best_event)
 
     async def _forward_input_to_streams(self, streams: list[RecognizeStream]) -> None:
-        """Reads from self._input_ch and forwards audio frames to each stream in parallel."""
-        with contextlib.suppress(RuntimeError):  # Suppress errors from closed streams
+        """
+        Reads from self._input_ch and forwards audio frames to each stream in parallel.
+        """
+        with contextlib.suppress(RuntimeError):
             async for data in self._input_ch:
-                if self._is_closed:
-                    break
-
-                # Update activity time for non-flush data
-                if isinstance(data, rtc.AudioFrame):
-                    self._last_activity_time = time.time()
-
-                active_streams = []
                 for stream in streams:
-                    try:
-                        if isinstance(data, rtc.AudioFrame):
-                            stream.push_frame(data)
-                        elif isinstance(data, self._FlushSentinel):
-                            stream.flush()
-                        active_streams.append(stream)
-                    except Exception as e:
-                        logger.warning(f"Error forwarding data to stream: {e}")
-
-                # Update our active streams list
-                streams[:] = active_streams
-
-            # Try to end input for remaining streams
-            if not self._is_closed:
-                for stream in streams:
-                    try:
-                        stream.end_input()
-                    except Exception:
-                        pass
+                    if isinstance(data, rtc.AudioFrame):
+                        stream.push_frame(data)
+                    elif isinstance(data, self._FlushSentinel):
+                        stream.flush()
+            for stream in streams:
+                stream.end_input()
 
     async def _consume_stream(self, idx: int, stream: RecognizeStream):
         """
@@ -526,43 +519,32 @@ class FallbackRecognizeStream(RecognizeStream):
         try:
             async with stream:
                 async for ev in stream:
-                    if self._is_closed:
-                        return None
+                    # Forward *all* events up the chain if you wish
+                    self._event_ch.send_nowait(ev)
 
-                    # Forward events with error suppression
-                    with contextlib.suppress(RuntimeError):
-                        self._event_ch.send_nowait(ev)
-
+                    # If a final transcript has text, we can either immediately
+                    # return it, or accumulate. Here, we'll just return on the
+                    # first non-empty final. That ensures *this* consumption
+                    # finishes quickly.
                     if ev.type in SpeechEventType.FINAL_TRANSCRIPT:
                         if ev.alternatives and ev.alternatives[0].text.strip():
                             return ev
+            # If the stream ended normally but no final transcript with text
             return None
         except asyncio.TimeoutError:
             logger.warning(
                 f"{stt.label} timed out in streaming, switching to next STT",
                 extra={"streamed": True},
             )
-            if not self._is_closed:
-                raise
-            return None
+            raise
         except APIError as e:
-            if isinstance(e, APIStatusError) and "Stream timed out" in str(e):
-                logger.warning(
-                    f"{stt.label} stream timed out, will retry",
-                    extra={"streamed": True},
-                )
-                return None
             logger.warning(
                 f"{stt.label} failed in streaming, switching to next STT",
                 exc_info=e,
                 extra={"streamed": True},
             )
-            if not self._is_closed:
-                raise
-            return None
-        except Exception as e:
-            if self._is_closed:
-                return None
+            raise
+        except Exception:
             logger.exception(
                 f"{stt.label} unexpected error in streaming, switching to next STT",
                 extra={"streamed": True},
