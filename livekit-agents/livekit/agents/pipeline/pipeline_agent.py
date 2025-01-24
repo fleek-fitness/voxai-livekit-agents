@@ -741,7 +741,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         # adding an empty user message gives the LLM context so it could continue from where
         # it had been interrupted.
         copied_ctx.messages.append(
-            ChatMessage.create(text=handle.user_question, role="user")
+            ChatMessage.create(text=handle.user_question or " ", role="user")
         )
 
         tk = SpeechDataContextVar.set(SpeechData(sequence_id=handle.id))
