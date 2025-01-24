@@ -732,7 +732,8 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                 # Then add the previous assistant message
                 copied_ctx.messages.append(
                     ChatMessage.create(
-                        text=playing_speech.synthesis_handle.tts_forwarder.played_text,
+                        text=playing_speech.synthesis_handle.tts_forwarder.played_text
+                        or " ",
                         role="assistant",
                     )
                 )
