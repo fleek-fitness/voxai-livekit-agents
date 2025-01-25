@@ -181,8 +181,8 @@ class ParallelFallbackStream(RecognizeStream):
                         logger.info(f"STT-2 INTERIM: {ev.alternatives[0].text}")
 
                     elif ev.type == SpeechEventType.FINAL_TRANSCRIPT:
+                        logger.info(f"STT-2 FINAL: {ev.alternatives[0].text}")
                         if time.monotonic() - self._last_primary_interim_time > 1.5:
-                            logger.info(f"STT-2 FINAL: {ev.alternatives[0].text}")
                             self._secondary_final_buffer = ev
         except Exception as e:
             logger.error("Secondary STT stream failed", exc_info=e)
