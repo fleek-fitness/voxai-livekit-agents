@@ -5,7 +5,6 @@ from ..log import logger
 from .stt import STT, STTCapabilities, RecognizeStream, SpeechEvent, SpeechEventType
 from typing import Optional, Union, AsyncIterator
 from livekit import rtc
-from livekit.agents.stt import STT, STTCapabilities, SpeechEvent, SpeechEventType
 from livekit.agents.types import APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS
 from livekit.agents.utils import aio
 
