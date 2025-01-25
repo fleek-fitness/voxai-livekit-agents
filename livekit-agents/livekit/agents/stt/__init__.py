@@ -1,5 +1,6 @@
 from .fallback_adapter import AvailabilityChangedEvent, FallbackAdapter
 from .stream_adapter import StreamAdapter, StreamAdapterWrapper
+from .parallel_fallback_stt import ParallelFallbackSTT
 from .stt import (
     STT,
     RecognitionUsage,
@@ -24,4 +25,5 @@ __all__ = [
     "RecognitionUsage",
     "FallbackAdapter",
     "AvailabilityChangedEvent",
+    "ParallelFallbackSTT",
 ]
