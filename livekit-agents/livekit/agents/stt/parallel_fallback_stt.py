@@ -134,6 +134,7 @@ class ParallelFallbackStream(RecognizeStream):
                         continue  # Skip until state reset
 
                     if ev.type == SpeechEventType.INTERIM_TRANSCRIPT:
+                        logger.info(f"STT-1 INTERIM: {ev.alternatives[0].text}")
                         self._primary_has_interim = True
                         self._primary_interim_time = time.monotonic()
                         self._event_ch.send_nowait(ev)
@@ -141,6 +142,7 @@ class ParallelFallbackStream(RecognizeStream):
                         self._start_primary_timeout()
 
                     elif ev.type == SpeechEventType.FINAL_TRANSCRIPT:
+                        logger.info(f"STT-1 FINAL: {ev.alternatives[0].text}")
                         self._accepted_final = True
                         self._event_ch.send_nowait(ev)
                         self._should_restart.set()  # Signal for state reset
@@ -154,7 +156,11 @@ class ParallelFallbackStream(RecognizeStream):
                     if self._accepted_final:
                         continue  # Skip until state reset
 
+                    if ev.type == SpeechEventType.INTERIM_TRANSCRIPT:
+                        logger.info(f"STT-2 INTERIM: {ev.alternatives[0].text}")
+
                     if ev.type == SpeechEventType.FINAL_TRANSCRIPT:
+                        logger.info(f"STT-2 FINAL: {ev.alternatives[0].text}")
                         if not self._primary_has_interim:
                             # Immediate acceptance if no primary interim
                             self._accepted_final = True
