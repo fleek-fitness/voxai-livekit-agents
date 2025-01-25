@@ -124,6 +124,8 @@ class ParallelFallbackStream(RecognizeStream):
         self._secondary_task = asyncio.create_task(self._process_secondary())
         self._merged_aiter = self._merge_events()
 
+        self._last_primary_interim_time = 0.0  # Track last primary activity
+
     def _reset_state(self) -> None:
         """Reset internal state for next turn"""
         self._primary_has_interim = False
@@ -140,18 +142,28 @@ class ParallelFallbackStream(RecognizeStream):
                         continue
 
                     if ev.type == SpeechEventType.INTERIM_TRANSCRIPT:
+                        self._last_primary_interim_time = time.monotonic()
                         logger.info(f"STT-1 INTERIM: {ev.alternatives[0].text}")
                         self._primary_has_interim = True
-                        self._primary_interim_time = time.monotonic()
                         self._event_ch.send_nowait(ev)
                         self._secondary_final_buffer = None
                         self._start_primary_timeout()
 
                     elif ev.type == SpeechEventType.FINAL_TRANSCRIPT:
-                        logger.info(f"STT-1 FINAL: {ev.alternatives[0].text}")
-                        self._accepted_final = True
-                        self._event_ch.send_nowait(ev)
-                        self._should_restart.set()
+                        # Cancel pending timeouts
+                        for t in self._pending_timers:
+                            t.cancel()
+                        self._pending_timers.clear()
+
+                        if (
+                            self._secondary_final_buffer is None
+                            or ev.alternatives[0].confidence
+                            > self._secondary_final_buffer.alternatives[0].confidence
+                        ):
+                            logger.info(f"STT-1 FINAL: {ev.alternatives[0].text}")
+                            self._accepted_final = True
+                            self._event_ch.send_nowait(ev)
+                            self._should_restart.set()
         except Exception as e:
             logger.error("Primary STT stream failed", exc_info=e)
         finally:
@@ -169,12 +181,8 @@ class ParallelFallbackStream(RecognizeStream):
                         logger.info(f"STT-2 INTERIM: {ev.alternatives[0].text}")
 
                     elif ev.type == SpeechEventType.FINAL_TRANSCRIPT:
-                        logger.info(f"STT-2 FINAL: {ev.alternatives[0].text}")
-                        if not self._primary_has_interim:
-                            self._accepted_final = True
-                            self._event_ch.send_nowait(ev)
-                            self._should_restart.set()
-                        else:
+                        if time.monotonic() - self._last_primary_interim_time > 1.5:
+                            logger.info(f"STT-2 FINAL: {ev.alternatives[0].text}")
                             self._secondary_final_buffer = ev
         except Exception as e:
             logger.error("Secondary STT stream failed", exc_info=e)
@@ -184,12 +192,20 @@ class ParallelFallbackStream(RecognizeStream):
 
     def _start_primary_timeout(self):
         async def _timeout_check():
-            await asyncio.sleep(self._final_timeout)
+            # Dynamic timeout based on speech cadence
+            timeout = min(
+                self._final_timeout,
+                max(3.0, (time.monotonic() - self._last_primary_interim_time) * 2),
+            )
+            await asyncio.sleep(timeout)
+
             async with self._lock:
                 if not self._accepted_final and self._secondary_final_buffer:
-                    self._accepted_final = True
-                    self._event_ch.send_nowait(self._secondary_final_buffer)
-                    self._should_restart.set()  # Trigger reset without closing streams
+                    if time.monotonic() - self._last_primary_interim_time > 1.0:
+                        logger.info("Using secondary STT fallback result")
+                        self._accepted_final = True
+                        self._event_ch.send_nowait(self._secondary_final_buffer)
+                        self._should_restart.set()
 
         timer = asyncio.create_task(_timeout_check())
         self._pending_timers.add(timer)
