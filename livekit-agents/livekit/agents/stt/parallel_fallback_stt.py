@@ -9,7 +9,7 @@ from .stt import STT, STTCapabilities, SpeechEvent, SpeechEventType, RecognizeSt
 from livekit.agents.types import APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS
 from livekit.agents.utils import aio
 from livekit.agents._exceptions import APIConnectionError
-from ..types import AudioBuffer
+from livekit.agents.utils.audio import AudioBuffer
 
 
 class ParallelFallbackSTT(STT):
