@@ -155,8 +155,8 @@ class ParallelFallbackStream(RecognizeStream):
         except Exception as e:
             logger.error("Primary STT stream failed", exc_info=e)
         finally:
+            # Don't close the stream, just mark it as inactive
             self._primary_active.clear()
-            await self._primary.aclose()
 
     async def _process_secondary(self):
         try:
@@ -165,7 +165,11 @@ class ParallelFallbackStream(RecognizeStream):
                     if self._accepted_final:
                         continue
 
-                    if ev.type == SpeechEventType.FINAL_TRANSCRIPT:
+                    if ev.type == SpeechEventType.INTERIM_TRANSCRIPT:
+                        logger.info(f"STT-2 INTERIM: {ev.alternatives[0].text}")
+
+                    elif ev.type == SpeechEventType.FINAL_TRANSCRIPT:
+                        logger.info(f"STT-2 FINAL: {ev.alternatives[0].text}")
                         if not self._primary_has_interim:
                             self._accepted_final = True
                             self._event_ch.send_nowait(ev)
@@ -175,8 +179,8 @@ class ParallelFallbackStream(RecognizeStream):
         except Exception as e:
             logger.error("Secondary STT stream failed", exc_info=e)
         finally:
+            # Don't close the stream, just mark it as inactive
             self._secondary_active.clear()
-            await self._secondary.aclose()
 
     def _start_primary_timeout(self):
         async def _timeout_check():
@@ -185,7 +189,7 @@ class ParallelFallbackStream(RecognizeStream):
                 if not self._accepted_final and self._secondary_final_buffer:
                     self._accepted_final = True
                     self._event_ch.send_nowait(self._secondary_final_buffer)
-                    await self._close_streams()
+                    self._should_restart.set()  # Trigger reset without closing streams
 
         timer = asyncio.create_task(_timeout_check())
         self._pending_timers.add(timer)
@@ -274,8 +278,12 @@ class ParallelFallbackStream(RecognizeStream):
         try:
             while True:
                 await self._should_restart.wait()
-                self._reset_state()
-                self._should_restart.clear()
+                async with self._lock:
+                    self._reset_state()
+                    self._should_restart.clear()
+                    # Reactivate both streams for next utterance
+                    self._primary_active.set()
+                    self._secondary_active.set()
         except Exception as e:
             logger.error(f"ParallelFallbackStream failed: {str(e)}")
             raise
