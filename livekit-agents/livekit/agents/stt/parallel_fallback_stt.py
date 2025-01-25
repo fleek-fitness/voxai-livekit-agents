@@ -1,30 +1,80 @@
 from __future__ import annotations
 import asyncio
 import time
-from ..log import logger
-from .stt import STT, STTCapabilities, RecognizeStream, SpeechEvent, SpeechEventType
 from typing import Optional, Union, AsyncIterator
 from livekit import rtc
+from ..log import logger
+import dataclasses
+from ..stt import STT, STTCapabilities, SpeechEvent, SpeechEventType, RecognizeStream
 from livekit.agents.types import APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS
 from livekit.agents.utils import aio
+from livekit.agents._exceptions import APIConnectionError
+from ..types import AudioBuffer  # Make sure this import matches your project structure
 
 
 class ParallelFallbackSTT(STT):
     """
-    Parallel STT implementation that uses the primary STT's results unless it fails
-    to provide even interim transcripts, in which case it falls back to the secondary STT.
-    Handles cases where primary starts but never completes transcription.
+    Parallel STT implementation with fallback logic that:
+    1. Uses primary STT's results by default
+    2. Falls back to secondary STT only if primary fails to provide interim
+    3. Handles both streaming and non-streaming recognition
     """
 
     def __init__(self, primary: STT, secondary: STT, final_timeout: float = 5.0):
         super().__init__(
             capabilities=STTCapabilities(
-                streaming=True, interim_results=primary.capabilities.interim_results
+                streaming=primary.capabilities.streaming
+                and secondary.capabilities.streaming,
+                interim_results=primary.capabilities.interim_results,
             )
         )
         self._primary = primary
         self._secondary = secondary
         self._final_timeout = final_timeout
+
+    async def _recognize_impl(
+        self,
+        buffer: AudioBuffer,
+        *,
+        language: str | None,
+        conn_options: APIConnectOptions,
+    ) -> SpeechEvent:
+        """
+        Non-streaming recognition with fallback logic
+        """
+        start_time = time.monotonic()
+        timeout_remaining = conn_options.timeout
+
+        try:
+            # Try primary first with reduced retries
+            return await asyncio.wait_for(
+                self._primary.recognize(
+                    buffer,
+                    language=language,
+                    conn_options=dataclasses.replace(
+                        conn_options, max_retry=max(0, conn_options.max_retry - 1)
+                    ),
+                ),
+                timeout=timeout_remaining,
+            )
+        except Exception as primary_err:
+            logger.warning(f"Primary STT failed, trying secondary: {str(primary_err)}")
+
+            # Calculate remaining time for secondary attempt
+            elapsed = time.monotonic() - start_time
+            timeout_remaining = max(0, conn_options.timeout - elapsed)
+
+            try:
+                return await asyncio.wait_for(
+                    self._secondary.recognize(
+                        buffer, language=language, conn_options=conn_options
+                    ),
+                    timeout=timeout_remaining,
+                )
+            except Exception as secondary_err:
+                raise APIConnectionError(
+                    f"Both STTs failed. Primary: {primary_err}, Secondary: {secondary_err}"
+                ) from secondary_err
 
     async def aclose(self) -> None:
         await asyncio.gather(
@@ -46,14 +96,13 @@ class ParallelFallbackSTT(STT):
         )
 
 
-class ParallelFallbackStream(rtc.EventEmitter):
+class ParallelFallbackStream(RecognizeStream):
     def __init__(
-        self,
-        primary: RecognizeStream,
-        secondary: RecognizeStream,
-        final_timeout: float,
+        self, primary: RecognizeStream, secondary: RecognizeStream, final_timeout: float
     ):
-        super().__init__()
+        super().__init__(
+            stt=primary._stt, conn_options=primary._conn_options, sample_rate=None
+        )
         self._primary = primary
         self._secondary = secondary
         self._final_timeout = final_timeout
@@ -90,8 +139,6 @@ class ParallelFallbackStream(rtc.EventEmitter):
                         self._accepted_final = True
                         self._event_ch.send_nowait(ev)
                         await self._close_streams()
-        except Exception as e:
-            logger.error(f"Primary STT failed: {str(e)}")
         finally:
             await self._primary.aclose()
 
@@ -111,8 +158,6 @@ class ParallelFallbackStream(rtc.EventEmitter):
                         else:
                             # Store for potential timeout fallback
                             self._secondary_final_buffer = ev
-        except Exception as e:
-            logger.error(f"Secondary STT failed: {str(e)}")
         finally:
             await self._secondary.aclose()
 
@@ -138,7 +183,6 @@ class ParallelFallbackStream(rtc.EventEmitter):
 
     async def _close_streams(self):
         """Handle stream closure and pending timeouts"""
-        # Cancel any pending timeout checks
         for timer in self._pending_timers:
             timer.cancel()
 
@@ -146,7 +190,6 @@ class ParallelFallbackStream(rtc.EventEmitter):
             self._primary.aclose(), self._secondary.aclose(), return_exceptions=True
         )
 
-        # Emit buffered secondary final if primary failed
         if not self._accepted_final and self._secondary_final_buffer:
             self._event_ch.send_nowait(self._secondary_final_buffer)
 
@@ -174,7 +217,6 @@ class ParallelFallbackStream(rtc.EventEmitter):
         try:
             return await self._merged_aiter.__anext__()
         except StopAsyncIteration:
-            # Propagate any exceptions from processing tasks
             for task in [self._primary_task, self._secondary_task]:
                 if task.done() and not task.cancelled() and task.exception():
                     raise task.exception()
