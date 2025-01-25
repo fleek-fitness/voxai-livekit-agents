@@ -110,12 +110,18 @@ class ParallelFallbackStream(RecognizeStream):
         self._lock = asyncio.Lock()
         self._should_restart = asyncio.Event()
 
+        # Add stream state tracking
+        self._primary_active = asyncio.Event()
+        self._secondary_active = asyncio.Event()
+        self._primary_active.set()
+        self._secondary_active.set()
+
         # State management
         self._reset_state()
 
         # Start processing tasks
-        self._primary_task = None
-        self._secondary_task = None
+        self._primary_task = asyncio.create_task(self._process_primary())
+        self._secondary_task = asyncio.create_task(self._process_secondary())
         self._merged_aiter = self._merge_events()
 
     def _reset_state(self) -> None:
@@ -131,7 +137,7 @@ class ParallelFallbackStream(RecognizeStream):
             async for ev in self._primary:
                 async with self._lock:
                     if self._accepted_final:
-                        continue  # Skip until state reset
+                        continue
 
                     if ev.type == SpeechEventType.INTERIM_TRANSCRIPT:
                         logger.info(f"STT-1 INTERIM: {ev.alternatives[0].text}")
@@ -145,8 +151,11 @@ class ParallelFallbackStream(RecognizeStream):
                         logger.info(f"STT-1 FINAL: {ev.alternatives[0].text}")
                         self._accepted_final = True
                         self._event_ch.send_nowait(ev)
-                        self._should_restart.set()  # Signal for state reset
+                        self._should_restart.set()
+        except Exception as e:
+            logger.error("Primary STT stream failed", exc_info=e)
         finally:
+            self._primary_active.clear()
             await self._primary.aclose()
 
     async def _process_secondary(self):
@@ -154,22 +163,19 @@ class ParallelFallbackStream(RecognizeStream):
             async for ev in self._secondary:
                 async with self._lock:
                     if self._accepted_final:
-                        continue  # Skip until state reset
-
-                    if ev.type == SpeechEventType.INTERIM_TRANSCRIPT:
-                        logger.info(f"STT-2 INTERIM: {ev.alternatives[0].text}")
+                        continue
 
                     if ev.type == SpeechEventType.FINAL_TRANSCRIPT:
-                        logger.info(f"STT-2 FINAL: {ev.alternatives[0].text}")
                         if not self._primary_has_interim:
-                            # Immediate acceptance if no primary interim
                             self._accepted_final = True
                             self._event_ch.send_nowait(ev)
-                            self._should_restart.set()  # Signal for state reset
+                            self._should_restart.set()
                         else:
-                            # Store for potential timeout fallback
                             self._secondary_final_buffer = ev
+        except Exception as e:
+            logger.error("Secondary STT stream failed", exc_info=e)
         finally:
+            self._secondary_active.clear()
             await self._secondary.aclose()
 
     def _start_primary_timeout(self):
@@ -204,24 +210,51 @@ class ParallelFallbackStream(RecognizeStream):
         if not self._accepted_final and self._secondary_final_buffer:
             self._event_ch.send_nowait(self._secondary_final_buffer)
 
-    # Required stream interface methods
     def push_frame(self, frame: rtc.AudioFrame) -> None:
-        self._primary.push_frame(frame)
-        self._secondary.push_frame(frame)
+        """Handle frame pushing with active stream checks"""
+        if self._primary_active.is_set():
+            try:
+                self._primary.push_frame(frame)
+            except RuntimeError as e:
+                if "input ended" in str(e):
+                    logger.warning("Primary stream closed, stopping frame pushes")
+                    self._primary_active.clear()
+                else:
+                    raise
+
+        if self._secondary_active.is_set():
+            try:
+                self._secondary.push_frame(frame)
+            except RuntimeError as e:
+                if "input ended" in str(e):
+                    logger.warning("Secondary stream closed, stopping frame pushes")
+                    self._secondary_active.clear()
+                else:
+                    raise
+
+        if not self._primary_active.is_set() and not self._secondary_active.is_set():
+            raise APIConnectionError("All STT streams have failed")
 
     def flush(self) -> None:
-        self._primary.flush()
-        self._secondary.flush()
+        if self._primary_active.is_set():
+            self._primary.flush()
+        if self._secondary_active.is_set():
+            self._secondary.flush()
 
     def end_input(self) -> None:
-        self._primary.end_input()
-        self._secondary.end_input()
+        if self._primary_active.is_set():
+            self._primary.end_input()
+        if self._secondary_active.is_set():
+            self._secondary.end_input()
 
     async def aclose(self) -> None:
-        await self._close_streams()
-        await asyncio.gather(
-            self._primary_task, self._secondary_task, return_exceptions=True
-        )
+        """Handle cleanup with proper cancellation"""
+        tasks = [self._primary_task, self._secondary_task]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+        await asyncio.gather(*tasks, return_exceptions=True)
         self._event_ch.close()
 
     async def __anext__(self) -> SpeechEvent:
@@ -238,8 +271,6 @@ class ParallelFallbackStream(RecognizeStream):
 
     async def _run(self) -> None:
         """Main processing loop required by RecognizeStream"""
-        self._primary_task = asyncio.create_task(self._process_primary())
-        self._secondary_task = asyncio.create_task(self._process_secondary())
         try:
             while True:
                 await self._should_restart.wait()
