@@ -117,9 +117,19 @@ class ParallelFallbackStream(RecognizeStream):
         self._pending_timers = set()
 
         # Start processing tasks
+        self._primary_task = None  # Initialize tasks as None
+        self._secondary_task = None
+        self._merged_aiter = self._merge_events()
+
+    async def _run(self) -> None:
+        """Main processing loop required by RecognizeStream"""
         self._primary_task = asyncio.create_task(self._process_primary())
         self._secondary_task = asyncio.create_task(self._process_secondary())
-        self._merged_aiter = self._merge_events()
+        try:
+            await asyncio.gather(self._primary_task, self._secondary_task)
+        except Exception as e:
+            logger.error(f"ParallelFallbackStream failed: {str(e)}")
+            raise
 
     async def _process_primary(self):
         try:
