@@ -1,15 +1,15 @@
 from __future__ import annotations
 import asyncio
 import time
-from ..stt import STT, STTCapabilities, SpeechEvent, SpeechEventType, RecognizeStream
+import dataclasses
 from typing import Optional, Union, AsyncIterator
 from livekit import rtc
 from ..log import logger
-import dataclasses
+from .stt import STT, STTCapabilities, SpeechEvent, SpeechEventType, RecognizeStream
 from livekit.agents.types import APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS
 from livekit.agents.utils import aio
 from livekit.agents._exceptions import APIConnectionError
-from ..types import AudioBuffer  # Make sure this import matches your project structure
+from ..types import AudioBuffer
 
 
 class ParallelFallbackSTT(STT):
