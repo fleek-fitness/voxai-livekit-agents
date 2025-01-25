@@ -108,35 +108,30 @@ class ParallelFallbackStream(RecognizeStream):
         self._final_timeout = final_timeout
         self._event_ch = aio.Chan[SpeechEvent]()
         self._lock = asyncio.Lock()
+        self._should_restart = asyncio.Event()
 
         # State management
+        self._reset_state()
+
+        # Start processing tasks
+        self._primary_task = None
+        self._secondary_task = None
+        self._merged_aiter = self._merge_events()
+
+    def _reset_state(self) -> None:
+        """Reset internal state for next turn"""
         self._primary_has_interim = False
         self._accepted_final = False
         self._secondary_final_buffer = None
         self._primary_interim_time = None
         self._pending_timers = set()
 
-        # Start processing tasks
-        self._primary_task = None  # Initialize tasks as None
-        self._secondary_task = None
-        self._merged_aiter = self._merge_events()
-
-    async def _run(self) -> None:
-        """Main processing loop required by RecognizeStream"""
-        self._primary_task = asyncio.create_task(self._process_primary())
-        self._secondary_task = asyncio.create_task(self._process_secondary())
-        try:
-            await asyncio.gather(self._primary_task, self._secondary_task)
-        except Exception as e:
-            logger.error(f"ParallelFallbackStream failed: {str(e)}")
-            raise
-
     async def _process_primary(self):
         try:
             async for ev in self._primary:
                 async with self._lock:
                     if self._accepted_final:
-                        return
+                        continue  # Skip until state reset
 
                     if ev.type == SpeechEventType.INTERIM_TRANSCRIPT:
                         self._primary_has_interim = True
@@ -148,7 +143,7 @@ class ParallelFallbackStream(RecognizeStream):
                     elif ev.type == SpeechEventType.FINAL_TRANSCRIPT:
                         self._accepted_final = True
                         self._event_ch.send_nowait(ev)
-                        await self._close_streams()
+                        self._should_restart.set()  # Signal for state reset
         finally:
             await self._primary.aclose()
 
@@ -157,14 +152,14 @@ class ParallelFallbackStream(RecognizeStream):
             async for ev in self._secondary:
                 async with self._lock:
                     if self._accepted_final:
-                        return
+                        continue  # Skip until state reset
 
                     if ev.type == SpeechEventType.FINAL_TRANSCRIPT:
                         if not self._primary_has_interim:
                             # Immediate acceptance if no primary interim
                             self._accepted_final = True
                             self._event_ch.send_nowait(ev)
-                            await self._close_streams()
+                            self._should_restart.set()  # Signal for state reset
                         else:
                             # Store for potential timeout fallback
                             self._secondary_final_buffer = ev
@@ -234,3 +229,16 @@ class ParallelFallbackStream(RecognizeStream):
 
     def __aiter__(self) -> AsyncIterator[SpeechEvent]:
         return self
+
+    async def _run(self) -> None:
+        """Main processing loop required by RecognizeStream"""
+        self._primary_task = asyncio.create_task(self._process_primary())
+        self._secondary_task = asyncio.create_task(self._process_secondary())
+        try:
+            while True:
+                await self._should_restart.wait()
+                self._reset_state()
+                self._should_restart.clear()
+        except Exception as e:
+            logger.error(f"ParallelFallbackStream failed: {str(e)}")
+            raise
