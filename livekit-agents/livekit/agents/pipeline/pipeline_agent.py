@@ -983,10 +983,26 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                         },
                     )
                 fnc_ctx = None
-            answer_llm_stream = self._llm.chat(
-                chat_ctx=chat_ctx,
-                fnc_ctx=fnc_ctx,
-            )
+
+            # Use before_llm_cb to control assistant message creation
+            llm_stream = self._opts.before_llm_cb(self, chat_ctx)
+            if asyncio.iscoroutine(llm_stream):
+                llm_stream = await llm_stream
+
+            if llm_stream is False:
+                # Skip assistant message if callback returns False
+                self.emit("function_calls_finished", called_fncs)
+                _CallContextVar.reset(tk)
+                return
+
+            # Create assistant message only if callback allows
+            if not isinstance(llm_stream, LLMStream):
+                answer_llm_stream = self._llm.chat(
+                    chat_ctx=chat_ctx,
+                    fnc_ctx=fnc_ctx,
+                )
+            else:
+                answer_llm_stream = llm_stream
 
             synthesis_handle = self._synthesize_agent_speech(
                 new_speech_handle.id, answer_llm_stream
