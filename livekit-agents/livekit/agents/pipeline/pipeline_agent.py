@@ -19,7 +19,14 @@ from typing import (
 from livekit import rtc
 
 from .. import metrics, stt, tokenize, tts, utils, vad
-from ..llm import LLM, ChatContext, ChatMessage, FunctionContext, LLMStream
+from ..llm import (
+    LLM,
+    ChatContext,
+    ChatMessage,
+    FunctionContext,
+    LLMStream,
+    FunctionCallInfo,
+)
 from ..types import ATTRIBUTE_AGENT_STATE, AgentState
 from .agent_output import AgentOutput, SpeechSource, SynthesisHandle
 from .agent_playout import AgentPlayout
@@ -1209,6 +1216,106 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
     def _add_speech_for_playout(self, speech_handle: SpeechHandle) -> None:
         self._speech_q.append(speech_handle)
         self._speech_q_changed.set()
+
+    async def execute_function_directly(
+        self, function_name: str, arguments: dict, speak_result: bool = True
+    ) -> Any:
+        """Directly execute a function registered in the agent's function context
+
+        Args:
+            function_name: Name of the function to execute
+            arguments: Arguments to pass to the function
+            speak_result: Whether to speak the function result
+
+        Returns:
+            The result of the function execution
+        """
+        if not self.fnc_ctx or function_name not in self.fnc_ctx.ai_functions:
+            raise ValueError(f"Function {function_name} not found in function context")
+
+        from ..utils import shortuuid
+        import json
+
+        fnc_info = self.fnc_ctx.ai_functions[function_name]
+        call_info = FunctionCallInfo(
+            function_info=fnc_info,
+            arguments=arguments,
+            tool_call_id=shortuuid(),
+            raw_arguments=json.dumps(arguments),
+        )
+
+        # Emit function_calls_collected event before execution
+        self.emit("function_calls_collected", [call_info])
+
+        called_fnc = call_info.execute()
+        try:
+            await called_fnc.task
+            result = called_fnc.result
+
+            # Emit function_calls_finished event after execution
+            self.emit("function_calls_finished", [called_fnc])
+
+            if speak_result and result is not None:
+                # Create chat context with function result
+                chat_ctx = self._chat_ctx.copy()
+
+                # Add the tool call message first
+                tool_call_msg = ChatMessage.create_tool_calls(
+                    [call_info],
+                    # role="assistant"
+                )
+                chat_ctx.messages.append(tool_call_msg)
+                # Then add the tool response
+                chat_ctx.messages.append(
+                    ChatMessage.create_tool_from_called_function(called_fnc)
+                )
+
+                # Also store these messages in the main chat context
+                self._chat_ctx.messages.append(tool_call_msg)
+                self._chat_ctx.messages.append(
+                    ChatMessage.create_tool_from_called_function(called_fnc)
+                )
+
+                # Use before_llm_cb to control assistant message creation
+                llm_stream = self._opts.before_llm_cb(self, chat_ctx)
+
+                if asyncio.iscoroutine(llm_stream):
+                    llm_stream = await llm_stream
+
+                if (
+                    llm_stream is not False
+                ):  # Only proceed if callback doesn't return False
+                    # Create assistant message only if callback allows
+                    if not isinstance(llm_stream, LLMStream):
+                        answer_llm_stream = self._llm.chat(
+                            chat_ctx=chat_ctx,
+                            fnc_ctx=self.fnc_ctx,
+                        )
+                    else:
+                        answer_llm_stream = llm_stream
+
+                    speech_handle = SpeechHandle.create_assistant_speech(
+                        allow_interruptions=False, add_to_chat_ctx=True
+                    )
+                    synthesis_handle = self._synthesize_agent_speech(
+                        speech_handle.id, answer_llm_stream
+                    )
+                    speech_handle.initialize(
+                        source=answer_llm_stream, synthesis_handle=synthesis_handle
+                    )
+                    self._add_speech_for_playout(speech_handle)
+
+            return result
+
+        except Exception as e:
+            logger.exception(
+                "error executing function directly",
+                extra={
+                    "function": function_name,
+                },
+                exc_info=e,
+            )
+            raise
 
 
 class _DeferredReplyValidation:
