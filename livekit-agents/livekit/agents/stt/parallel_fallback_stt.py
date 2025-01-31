@@ -20,7 +20,13 @@ class ParallelFallbackSTT(STT):
     3. Handles both streaming and non-streaming recognition
     """
 
-    def __init__(self, primary: STT, secondary: STT, final_timeout: float = 5.0):
+    def __init__(
+        self,
+        primary: STT,
+        secondary: STT,
+        final_timeout: float = 5.0,
+        idle_timeout: float = 5.0,
+    ):
         super().__init__(
             capabilities=STTCapabilities(
                 streaming=primary.capabilities.streaming
@@ -31,6 +37,7 @@ class ParallelFallbackSTT(STT):
         self._primary = primary
         self._secondary = secondary
         self._final_timeout = final_timeout
+        self._idle_timeout = idle_timeout  # Add idle timeout
 
     async def _recognize_impl(
         self,
@@ -93,12 +100,20 @@ class ParallelFallbackSTT(STT):
                 language=language, conn_options=conn_options
             ),
             final_timeout=self._final_timeout,
+            idle_timeout=self._idle_timeout,  # Pass idle_timeout to stream
         )
 
 
 class ParallelFallbackStream(RecognizeStream):
+    IDLE_TIMEOUT = 3.0  # Define idle timeout as a class constant
+    FINAL_COOLDOWN_PERIOD = 1.0  # Add final cooldown period
+
     def __init__(
-        self, primary: RecognizeStream, secondary: RecognizeStream, final_timeout: float
+        self,
+        primary: RecognizeStream,
+        secondary: RecognizeStream,
+        final_timeout: float,
+        idle_timeout: float,
     ):
         super().__init__(
             stt=primary._stt, conn_options=primary._conn_options, sample_rate=None
@@ -106,8 +121,9 @@ class ParallelFallbackStream(RecognizeStream):
         self._primary = primary
         self._secondary = secondary
         self._final_timeout = final_timeout
+        self._idle_timeout = idle_timeout  # Use passed idle_timeout
         self._event_ch = aio.Chan[SpeechEvent]()
-        self._lock = asyncio.Lock()
+        self._lock = asyncio.Lock()  # Instance lock for _check_final
         self._should_restart = asyncio.Event()
 
         # Add stream state tracking
@@ -116,104 +132,171 @@ class ParallelFallbackStream(RecognizeStream):
         self._primary_active.set()
         self._secondary_active.set()
 
-        # State management
-        self._reset_state()
+        # State management for finals and activity
+        self._candidate_primary_final: Optional[SpeechEvent] = None
+        self._candidate_secondary_final: Optional[SpeechEvent] = None
+        self._accepted_final = False
+        self._last_primary_activity = 0.0  # Track primary activity for idle timeout
+        self._last_final_accepted_time = (
+            0.0  # Track last final accepted time for cooldown
+        )
 
         # Start processing tasks
         self._primary_task = asyncio.create_task(self._process_primary())
         self._secondary_task = asyncio.create_task(self._process_secondary())
         self._merged_aiter = self._merge_events()
-
-        self._last_primary_interim_time = 0.0  # Track last primary activity
+        self._idle_task = asyncio.create_task(self._idle_loop())  # Start idle loop
 
     def _reset_state(self) -> None:
         """Reset internal state for next turn"""
-        self._primary_has_interim = False
+        self._candidate_primary_final = None
+        self._candidate_secondary_final = None
         self._accepted_final = False
-        self._secondary_final_buffer = None
-        self._primary_interim_time = None
-        self._pending_timers = set()
+        self._last_primary_activity = 0.0
+        # self._last_final_accepted_time = 0.0 # Reset final accepted time
+
+    async def _idle_loop(self):
+        """Periodically check for primary inactivity and trigger fallback if needed."""
+        try:
+            while not self._accepted_final:
+                await asyncio.sleep(0.1)  # Check every 0.1 second
+                await self._check_idle_time()
+        except asyncio.CancelledError:
+            pass  # Expected on stream close
+
+    async def _check_idle_time(self):
+        """If primary is silent for too long, consider fallback to secondary."""
+        async with self._lock:  # Use lock here as well to be consistent and prevent race in idle timeout check.
+            if self._accepted_final and (
+                time.monotonic() - self._last_final_accepted_time
+                < self.FINAL_COOLDOWN_PERIOD
+            ):
+                return  # In cooldown period
+
+            if self._accepted_final:  # Already accepted a final
+                return
+
+            now = time.monotonic()
+            if (
+                now - self._last_primary_activity
+            ) > self._idle_timeout and self._candidate_secondary_final:
+                logger.info(
+                    "Idle timeout reached, falling back to secondary STT final."
+                )
+                await self._accept_final(self._candidate_secondary_final)
+            elif (
+                (now - self._last_primary_activity) > self._final_timeout
+                and not self._candidate_primary_final
+                and self._candidate_secondary_final
+            ):  # Fallback after final timeout if primary failed to give final
+                logger.warning(
+                    "Final timeout reached and primary STT has no final, falling back to secondary STT final."
+                )
+                await self._accept_final(self._candidate_secondary_final)
+            # elif (now - self._last_primary_activity) > self._final_timeout and not self._candidate_primary_final and not self._candidate_secondary_final: # Fallback to empty final after final timeout if neither STT has final
+            #     logger.warning("Final timeout reached and neither STT has final, sending empty final.")
+            #     empty_final_event = SpeechEvent(type=SpeechEventType.FINAL_TRANSCRIPT, alternatives=[rtc.SpeechAlternative(text="", confidence=1.0)])
+            #     await self._accept_final(empty_final_event)
+
+    async def _accept_final(self, final_event: SpeechEvent):
+        """Centralized method to accept and emit a final event."""
+        if (
+            self._accepted_final
+        ):  # Prevent emitting multiple finals - Double check here as well.
+            return
+        if (
+            time.monotonic() - self._last_final_accepted_time
+            < self.FINAL_COOLDOWN_PERIOD
+        ):
+            logger.info(
+                f"Final cooldown period not over, skipping emission. Last final accepted time: {self._last_final_accepted_time}, current time: {time.monotonic()}"
+            )
+            self._reset_state()
+            return
+        self._accepted_final = True
+        self._last_final_accepted_time = time.monotonic()  # Record final accepted time
+        logger.info(
+            f"Emitting final transcript: {final_event.alternatives[0].text if final_event.alternatives else ''} from STT: {final_event.stt_name if hasattr(final_event, 'stt_name') else 'Unknown'}"
+        )  # Log source of final
+        self._event_ch.send_nowait(final_event)
+        self._should_restart.set()
+
+    async def _check_final(self):
+        """Determine which final to accept (primary, secondary, or best)."""
+        async with self._lock:  # Acquire lock to make _check_final atomic
+            if self._accepted_final and (
+                time.monotonic() - self._last_final_accepted_time
+                < self.FINAL_COOLDOWN_PERIOD
+            ):
+                return  # In cooldown period
+
+            if self._accepted_final:
+                return
+
+            if self._candidate_primary_final:
+                logger.info("Primary final available, using primary STT final.")
+                await self._accept_final(self._candidate_primary_final)
+                return
+            elif self._candidate_secondary_final:
+                # Check idle time first before accepting secondary immediately in _check_idle_time
+                now = time.monotonic()
+                if (now - self._last_primary_activity) > (
+                    self._idle_timeout / 2.0
+                ):  # Shorter grace period before considering secondary final immediately if available
+                    logger.info(
+                        "Secondary final available and primary idle, using secondary STT final."
+                    )
+                    await self._accept_final(self._candidate_secondary_final)
+                    return
+                else:
+                    logger.info(
+                        "Secondary final available, waiting for primary or idle timeout."
+                    )
+                    return
 
     async def _process_primary(self):
         try:
             async for ev in self._primary:
-                async with self._lock:
-                    if self._accepted_final:
-                        continue
+                if ev.type == SpeechEventType.INTERIM_TRANSCRIPT:
+                    self._last_primary_activity = time.monotonic()
+                    logger.info(f"STT-1 INTERIM: {ev.alternatives[0].text}")
+                    ev.stt_name = "STT-1"  # Add STT name for logging
+                    self._event_ch.send_nowait(ev)
 
-                    if ev.type == SpeechEventType.INTERIM_TRANSCRIPT:
-                        self._last_primary_interim_time = time.monotonic()
-                        logger.info(f"STT-1 INTERIM: {ev.alternatives[0].text}")
-                        self._primary_has_interim = True
-                        self._event_ch.send_nowait(ev)
-                        self._secondary_final_buffer = None
-                        self._start_primary_timeout()
+                elif ev.type == SpeechEventType.FINAL_TRANSCRIPT:
+                    logger.info(f"STT-1 FINAL: {ev.alternatives[0].text}")
+                    ev.stt_name = "STT-1"  # Add STT name for logging
+                    async with self._lock:  # Acquire lock before processing final
+                        if self._accepted_final:  # Re-check inside lock!
+                            continue  # Already accepted a final, discard this one
+                        self._candidate_primary_final = ev  # Store primary final
+                    await self._check_final()  # Centralized final check
 
-                    elif ev.type == SpeechEventType.FINAL_TRANSCRIPT:
-                        # Cancel pending timeouts
-                        for t in self._pending_timers:
-                            t.cancel()
-                        self._pending_timers.clear()
-
-                        if (
-                            self._secondary_final_buffer is None
-                            or ev.alternatives[0].confidence
-                            > self._secondary_final_buffer.alternatives[0].confidence
-                        ):
-                            logger.info(f"STT-1 FINAL: {ev.alternatives[0].text}")
-                            self._accepted_final = True
-                            self._event_ch.send_nowait(ev)
-                            self._should_restart.set()
         except Exception as e:
             logger.error("Primary STT stream failed", exc_info=e)
         finally:
-            # Don't close the stream, just mark it as inactive
             self._primary_active.clear()
 
     async def _process_secondary(self):
         try:
             async for ev in self._secondary:
-                async with self._lock:
-                    if self._accepted_final:
-                        continue
+                if ev.type == SpeechEventType.INTERIM_TRANSCRIPT:
+                    logger.info(f"STT-2 INTERIM: {ev.alternatives[0].text}")
+                    ev.stt_name = "STT-2"  # Add STT name for logging
 
-                    if ev.type == SpeechEventType.INTERIM_TRANSCRIPT:
-                        logger.info(f"STT-2 INTERIM: {ev.alternatives[0].text}")
+                elif ev.type == SpeechEventType.FINAL_TRANSCRIPT:
+                    logger.info(f"STT-2 FINAL: {ev.alternatives[0].text}")
+                    ev.stt_name = "STT-2"  # Add STT name for logging
+                    async with self._lock:  # Acquire lock before processing final
+                        if self._accepted_final:  # Re-check inside lock!
+                            continue  # Already accepted a final, discard this one
+                        self._candidate_secondary_final = ev  # Store secondary final
+                    await self._check_final()  # Centralized final check
 
-                    elif ev.type == SpeechEventType.FINAL_TRANSCRIPT:
-                        logger.info(f"STT-2 FINAL: {ev.alternatives[0].text}")
-                        if time.monotonic() - self._last_primary_interim_time > 1.5:
-                            self._secondary_final_buffer = ev
-                            # Send the final result immediately
-                            self._accepted_final = True
-                            self._event_ch.send_nowait(ev)
-                            self._should_restart.set()
         except Exception as e:
             logger.error("Secondary STT stream failed", exc_info=e)
         finally:
-            # Don't close the stream, just mark it as inactive
             self._secondary_active.clear()
-
-    def _start_primary_timeout(self):
-        async def _timeout_check():
-            # Dynamic timeout based on speech cadence
-            timeout = min(
-                self._final_timeout,
-                max(3.0, (time.monotonic() - self._last_primary_interim_time) * 2),
-            )
-            await asyncio.sleep(timeout)
-
-            async with self._lock:
-                if not self._accepted_final and self._secondary_final_buffer:
-                    if time.monotonic() - self._last_primary_interim_time > 1.0:
-                        logger.info("Using secondary STT fallback result")
-                        self._accepted_final = True
-                        self._event_ch.send_nowait(self._secondary_final_buffer)
-                        self._should_restart.set()
-
-        timer = asyncio.create_task(_timeout_check())
-        self._pending_timers.add(timer)
-        timer.add_done_callback(lambda t: self._pending_timers.discard(t))
 
     async def _merge_events(self) -> AsyncIterator[SpeechEvent]:
         try:
@@ -224,15 +307,12 @@ class ParallelFallbackStream(RecognizeStream):
 
     async def _close_streams(self):
         """Handle stream closure and pending timeouts"""
-        for timer in self._pending_timers:
-            timer.cancel()
+        if not self._accepted_final and self._candidate_secondary_final:
+            await self._accept_final(self._candidate_secondary_final)
 
         await asyncio.gather(
             self._primary.aclose(), self._secondary.aclose(), return_exceptions=True
         )
-
-        if not self._accepted_final and self._secondary_final_buffer:
-            self._event_ch.send_nowait(self._secondary_final_buffer)
 
     def push_frame(self, frame: rtc.AudioFrame) -> None:
         """Handle frame pushing with active stream checks"""
@@ -269,16 +349,24 @@ class ParallelFallbackStream(RecognizeStream):
         if self._primary_active.is_set():
             self._primary.end_input()
         if self._secondary_active.is_set():
+            self._primary.end_input()
+        if self._secondary_active.is_set():
             self._secondary.end_input()
 
     async def aclose(self) -> None:
         """Handle cleanup with proper cancellation"""
-        tasks = [self._primary_task, self._secondary_task]
+        self._idle_task.cancel()  # Cancel idle loop
+        tasks = [
+            self._primary_task,
+            self._secondary_task,
+            self._idle_task,
+        ]  # Include idle task
         for task in tasks:
             if not task.done():
                 task.cancel()
 
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self._close_streams()  # Call close streams to handle pending final
         self._event_ch.close()
 
     async def __anext__(self) -> SpeechEvent:
