@@ -25,7 +25,6 @@ class ParallelFallbackSTT(STT):
         primary: STT,
         secondary: STT,
         final_timeout: float = 5.0,
-        idle_timeout: float = 5.0,
     ):
         super().__init__(
             capabilities=STTCapabilities(
@@ -37,7 +36,6 @@ class ParallelFallbackSTT(STT):
         self._primary = primary
         self._secondary = secondary
         self._final_timeout = final_timeout
-        self._idle_timeout = idle_timeout  # Add idle timeout
 
     async def _recognize_impl(
         self,
@@ -100,12 +98,10 @@ class ParallelFallbackSTT(STT):
                 language=language, conn_options=conn_options
             ),
             final_timeout=self._final_timeout,
-            idle_timeout=self._idle_timeout,  # Pass idle_timeout to stream
         )
 
 
 class ParallelFallbackStream(RecognizeStream):
-    IDLE_TIMEOUT = 3.0  # Define idle timeout as a class constant
     FINAL_COOLDOWN_PERIOD = 1.0  # Add final cooldown period
 
     def __init__(
@@ -113,7 +109,6 @@ class ParallelFallbackStream(RecognizeStream):
         primary: RecognizeStream,
         secondary: RecognizeStream,
         final_timeout: float,
-        idle_timeout: float,
     ):
         super().__init__(
             stt=primary._stt, conn_options=primary._conn_options, sample_rate=None
@@ -121,7 +116,6 @@ class ParallelFallbackStream(RecognizeStream):
         self._primary = primary
         self._secondary = secondary
         self._final_timeout = final_timeout
-        self._idle_timeout = idle_timeout  # Use passed idle_timeout
         self._event_ch = aio.Chan[SpeechEvent]()
         self._lock = asyncio.Lock()  # Instance lock for _check_final
         self._should_restart = asyncio.Event()
@@ -177,14 +171,8 @@ class ParallelFallbackStream(RecognizeStream):
                 return
 
             now = time.monotonic()
+
             if (
-                now - self._last_primary_activity
-            ) > self._idle_timeout and self._candidate_secondary_final:
-                logger.info(
-                    "Idle timeout reached, falling back to secondary STT final."
-                )
-                await self._accept_final(self._candidate_secondary_final)
-            elif (
                 (now - self._last_primary_activity) > self._final_timeout
                 and not self._candidate_primary_final
                 and self._candidate_secondary_final
@@ -193,10 +181,6 @@ class ParallelFallbackStream(RecognizeStream):
                     "Final timeout reached and primary STT has no final, falling back to secondary STT final."
                 )
                 await self._accept_final(self._candidate_secondary_final)
-            # elif (now - self._last_primary_activity) > self._final_timeout and not self._candidate_primary_final and not self._candidate_secondary_final: # Fallback to empty final after final timeout if neither STT has final
-            #     logger.warning("Final timeout reached and neither STT has final, sending empty final.")
-            #     empty_final_event = SpeechEvent(type=SpeechEventType.FINAL_TRANSCRIPT, alternatives=[rtc.SpeechAlternative(text="", confidence=1.0)])
-            #     await self._accept_final(empty_final_event)
 
     async def _accept_final(self, final_event: SpeechEvent):
         """Centralized method to accept and emit a final event."""
@@ -240,9 +224,9 @@ class ParallelFallbackStream(RecognizeStream):
             elif self._candidate_secondary_final:
                 # Check idle time first before accepting secondary immediately in _check_idle_time
                 now = time.monotonic()
-                if (now - self._last_primary_activity) > (
-                    self._idle_timeout / 2.0
-                ):  # Shorter grace period before considering secondary final immediately if available
+                if (
+                    now - self._last_primary_activity
+                ) > 3.0:  # Shorter grace period before considering secondary final immediately if available
                     logger.info(
                         "Secondary final available and primary idle, using secondary STT final."
                     )
