@@ -147,6 +147,10 @@ class ParallelFallbackStream(RecognizeStream):
         self._candidate_secondary_final = None
         self._accepted_final = False
         self._last_primary_activity = 0.0
+
+        # start a new idle loop
+        self._idle_task.cancel()
+        self._idle_task = asyncio.create_task(self._idle_loop())
         # self._last_final_accepted_time = 0.0 # Reset final accepted time
 
     async def _idle_loop(self):
@@ -165,9 +169,15 @@ class ParallelFallbackStream(RecognizeStream):
                 time.monotonic() - self._last_final_accepted_time
                 < self.FINAL_COOLDOWN_PERIOD
             ):
+                logger.info(
+                    f"Skipping idle check - in cooldown period ({time.monotonic() - self._last_final_accepted_time:.2f}s < {self.FINAL_COOLDOWN_PERIOD}s)"
+                )
                 return  # In cooldown period
 
             if self._accepted_final:  # Already accepted a final
+                logger.info(
+                    "Skipping idle check - final already accepted for this turn"
+                )
                 return
 
             now = time.monotonic()
@@ -369,7 +379,9 @@ class ParallelFallbackStream(RecognizeStream):
         """Main processing loop required by RecognizeStream"""
         try:
             while True:
+                logger.info("WAITING FOR SHOULD_RESTART")
                 await self._should_restart.wait()
+                logger.info("SHOULD_RESTART")
                 async with self._lock:
                     self._reset_state()
                     self._should_restart.clear()
