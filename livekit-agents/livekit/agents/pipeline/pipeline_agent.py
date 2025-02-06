@@ -1236,6 +1236,8 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         from ..utils import shortuuid
         import json
 
+        self._transcribed_text = ""
+
         fnc_info = self.fnc_ctx.ai_functions[function_name]
         call_info = FunctionCallInfo(
             function_info=fnc_info,
