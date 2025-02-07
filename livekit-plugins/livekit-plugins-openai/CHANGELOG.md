@@ -1,5 +1,17 @@
 # livekit-plugins-openai
 
+## 0.10.17
+
+### Patch Changes
+
+- gemini-realtime: fix input audio sample rate - [#1411](https://github.com/livekit/agents/pull/1411) ([@jayeshp19](https://github.com/jayeshp19))
+
+## 0.10.16
+
+### Patch Changes
+
+- add generate_reply api for multimodal agent - [#1359](https://github.com/livekit/agents/pull/1359) ([@longcw](https://github.com/longcw))
+
 ## 0.10.15
 
 ### Patch Changes

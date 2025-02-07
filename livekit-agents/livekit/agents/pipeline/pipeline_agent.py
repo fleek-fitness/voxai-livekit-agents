@@ -745,12 +745,14 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                     )
                 )
 
-        # we want to add this question even if it's empty. during false positive interruptions,
-        # adding an empty user message gives the LLM context so it could continue from where
-        # it had been interrupted.
-        copied_ctx.messages.append(
-            ChatMessage.create(text=handle.user_question or " ", role="user")
-        )
+        # when user_question is empty, it's due to a false positive interruption
+        # when this happens, we'd want to add a continue marker to the chat context.
+        # while some LLMs could deal with empty content during an inference request
+        # others would fail.
+        user_input = handle.user_question
+        if not user_input.strip():
+            user_input = "<continue>"
+        copied_ctx.messages.append(ChatMessage.create(text=user_input, role="user"))
 
         tk = SpeechDataContextVar.set(SpeechData(sequence_id=handle.id))
         try:
@@ -759,6 +761,13 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                 llm_stream = await llm_stream
 
             if llm_stream is False:
+                # user chose not to synthesize an answer, so we do not want to
+                # leave the same question in chat context. otherwise it would be
+                # unintentionally committed when the next set of speech comes in.
+                if len(self._transcribed_text) >= len(handle.user_question):
+                    self._transcribed_text = self._transcribed_text[
+                        len(handle.user_question) :
+                    ]
                 handle.cancel()
                 return
 
@@ -980,6 +989,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                 fnc_ctx
                 and new_speech_handle.fnc_nested_depth
                 >= self._opts.max_nested_fnc_calls
+                and not self._llm.capabilities.requires_persistent_functions
             ):
                 if len(fnc_ctx.ai_functions) > 1:
                     logger.info(

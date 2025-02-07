@@ -37,7 +37,7 @@ from .api_proto import (
     _build_gemini_ctx,
     _build_tools,
 )
-from .transcriber import TranscriberSession, TranscriptionContent
+from .transcriber import ModelTranscriber, TranscriberSession, TranscriptionContent
 
 EventTypes = Literal[
     "start_session",
@@ -75,6 +75,7 @@ class InputTranscription:
 @dataclass
 class Capabilities:
     supports_truncate: bool
+    input_audio_sample_rate: int | None = None
 
 
 @dataclass
@@ -103,7 +104,7 @@ class RealtimeModel:
         self,
         *,
         instructions: str | None = None,
-        model: LiveAPIModels | str = "gemini-2.0-flash-exp",
+        model: LiveAPIModels | str = "gemini-2.0-flash-001",
         api_key: str | None = None,
         voice: Voice | str = "Puck",
         modalities: list[Modality] = ["AUDIO"],
@@ -135,7 +136,7 @@ class RealtimeModel:
             instructions (str, optional): Initial system instructions for the model. Defaults to "".
             api_key (str or None, optional): Google Gemini API key. If None, will attempt to read from the environment variable GOOGLE_API_KEY.
             modalities (list[Modality], optional): Modalities to use, such as ["TEXT", "AUDIO"]. Defaults to ["AUDIO"].
-            model (str or None, optional): The name of the model to use. Defaults to "gemini-2.0-flash-exp".
+            model (str or None, optional): The name of the model to use. Defaults to "gemini-2.0-flash-001".
             voice (api_proto.Voice, optional): Voice setting for audio outputs. Defaults to "Puck".
             enable_user_audio_transcription (bool, optional): Whether to enable user audio transcription. Defaults to True
             enable_agent_audio_transcription (bool, optional): Whether to enable agent audio transcription. Defaults to True
@@ -156,6 +157,7 @@ class RealtimeModel:
         super().__init__()
         self._capabilities = Capabilities(
             supports_truncate=False,
+            input_audio_sample_rate=16000,
         )
         self._model = model
         self._loop = loop or asyncio.get_event_loop()
@@ -299,7 +301,7 @@ class GeminiRealtimeSession(utils.EventEmitter[EventTypes]):
             )
             self._transcriber.on("input_speech_done", self._on_input_speech_done)
         if self._opts.enable_agent_audio_transcription:
-            self._agent_transcriber = TranscriberSession(
+            self._agent_transcriber = ModelTranscriber(
                 client=self._client, model=self._opts.model
             )
             self._agent_transcriber.on("input_speech_done", self._on_agent_speech_done)
@@ -307,8 +309,6 @@ class GeminiRealtimeSession(utils.EventEmitter[EventTypes]):
         self._init_sync_task = asyncio.create_task(asyncio.sleep(0))
         self._send_ch = utils.aio.Chan[ClientEvents]()
         self._active_response_id = None
-        if chat_ctx:
-            self.generate_reply(chat_ctx)
 
     async def aclose(self) -> None:
         if self._send_ch.closed:
@@ -336,25 +336,6 @@ class GeminiRealtimeSession(utils.EventEmitter[EventTypes]):
     def _queue_msg(self, msg: ClientEvents) -> None:
         self._send_ch.send_nowait(msg)
 
-    def generate_reply(
-        self,
-        ctx: llm.ChatContext | llm.ChatMessage,
-        turn_complete: bool = True,
-    ) -> None:
-        if isinstance(ctx, llm.ChatMessage) and isinstance(ctx.content, str):
-            new_chat_ctx = llm.ChatContext()
-            new_chat_ctx.append(text=ctx.content, role=ctx.role)
-        elif isinstance(ctx, llm.ChatContext):
-            new_chat_ctx = ctx
-        else:
-            raise ValueError("Invalid chat context")
-        turns, _ = _build_gemini_ctx(new_chat_ctx, id(self))
-        client_content = LiveClientContent(
-            turn_complete=turn_complete,
-            turns=turns,
-        )
-        self._queue_msg(client_content)
-
     def chat_ctx_copy(self) -> llm.ChatContext:
         return self._chat_ctx.copy()
 
@@ -370,7 +351,16 @@ class GeminiRealtimeSession(utils.EventEmitter[EventTypes]):
             "cancel_existing", "cancel_new", "keep_both"
         ] = "keep_both",
     ) -> None:
-        raise NotImplementedError("create_response is not supported yet")
+        turns, _ = _build_gemini_ctx(self._chat_ctx, id(self))
+        ctx = [self._opts.instructions] + turns if self._opts.instructions else turns
+
+        if not ctx:
+            logger.warning(
+                "gemini-realtime-session: No chat context to send, sending dummy content."
+            )
+            ctx = [Content(parts=[Part(text=".")])]
+
+        self._queue_msg(LiveClientContent(turns=ctx, turn_complete=True))
 
     def commit_audio_buffer(self) -> None:
         raise NotImplementedError("commit_audio_buffer is not supported yet")
@@ -379,19 +369,20 @@ class GeminiRealtimeSession(utils.EventEmitter[EventTypes]):
         return True
 
     def _on_input_speech_done(self, content: TranscriptionContent) -> None:
-        self.emit(
-            "input_speech_transcription_completed",
-            InputTranscription(
-                item_id=content.response_id,
-                transcript=content.text,
-            ),
-        )
+        if content.response_id and content.text:
+            self.emit(
+                "input_speech_transcription_completed",
+                InputTranscription(
+                    item_id=content.response_id,
+                    transcript=content.text,
+                ),
+            )
 
         # self._chat_ctx.append(text=content.text, role="user")
         # TODO: implement sync mechanism to make sure the transcribed user speech is inside the chat_ctx and always before the generated agent speech
 
     def _on_agent_speech_done(self, content: TranscriptionContent) -> None:
-        if not self._is_interrupted:
+        if content.response_id and content.text:
             self.emit(
                 "agent_speech_transcription_completed",
                 InputTranscription(
@@ -448,10 +439,12 @@ class GeminiRealtimeSession(utils.EventEmitter[EventTypes]):
                                         // 2,
                                     )
                                     if self._opts.enable_agent_audio_transcription:
-                                        self._agent_transcriber._push_audio(frame)
+                                        content.audio.append(frame)
                                     content.audio_stream.send_nowait(frame)
 
                         if server_content.interrupted or server_content.turn_complete:
+                            if self._opts.enable_agent_audio_transcription:
+                                self._agent_transcriber._push_audio(content.audio)
                             for stream in (content.text_stream, content.audio_stream):
                                 if isinstance(stream, utils.aio.Chan):
                                     stream.close()

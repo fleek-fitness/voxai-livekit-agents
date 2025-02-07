@@ -1,5 +1,17 @@
 # livekit-plugins-elevenlabs
 
+## 0.7.12
+
+### Patch Changes
+
+- improved TTFB metrics for streaming TTS - [#1431](https://github.com/livekit/agents/pull/1431) ([@davidzhao](https://github.com/davidzhao))
+
+## 0.7.11
+
+### Patch Changes
+
+- add latest model by 11labs - [#1396](https://github.com/livekit/agents/pull/1396) ([@jayeshp19](https://github.com/jayeshp19))
+
 ## 0.7.10
 
 ### Patch Changes
