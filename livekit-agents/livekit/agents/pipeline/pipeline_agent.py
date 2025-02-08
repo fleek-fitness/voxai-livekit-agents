@@ -1337,7 +1337,7 @@ class _DeferredReplyValidation:
     PUNCTUATION = ".!?"
     PUNCTUATION_REDUCE_FACTOR = 0.75
 
-    FINAL_TRANSCRIPT_TIMEOUT = 1
+    FINAL_TRANSCRIPT_TIMEOUT = 3
 
     def __init__(
         self,
