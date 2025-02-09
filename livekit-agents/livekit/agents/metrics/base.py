@@ -23,6 +23,12 @@ class LLMMetrics:
     tokens_per_second: float
     error: Error | None
 
+    @dataclass
+    class PromptTokensDetails:
+        cached_tokens: int
+
+    prompt_tokens_details: PromptTokensDetails | None
+
 
 @dataclass
 class STTMetrics:

@@ -40,6 +40,12 @@ class CompletionUsage:
     prompt_tokens: int
     total_tokens: int
 
+    @dataclass
+    class PromptTokensDetails:
+        cached_tokens: int
+
+    prompt_tokens_details: PromptTokensDetails | None = None
+
 
 @dataclass
 class Choice:
@@ -97,8 +103,9 @@ class LLM(
         temperature: float | None = None,
         n: int | None = None,
         parallel_tool_calls: bool | None = None,
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]]
-        | None = None,
+        tool_choice: (
+            Union[ToolChoice, Literal["auto", "required", "none"]] | None
+        ) = None,
     ) -> "LLMStream": ...
 
     @property
@@ -201,6 +208,7 @@ class LLMStream(ABC):
             prompt_tokens=usage.prompt_tokens if usage else 0,
             total_tokens=usage.total_tokens if usage else 0,
             tokens_per_second=usage.completion_tokens / duration if usage else 0.0,
+            prompt_tokens_details=usage.prompt_tokens_details if usage else None,
             error=None,
         )
         self._llm.emit("metrics_collected", metrics)

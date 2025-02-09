@@ -650,8 +650,9 @@ class LLM(llm.LLM):
         temperature: float | None = None,
         n: int | None = 1,
         parallel_tool_calls: bool | None = None,
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]]
-        | None = None,
+        tool_choice: (
+            Union[ToolChoice, Literal["auto", "required", "none"]] | None
+        ) = None,
     ) -> "LLMStream":
         if parallel_tool_calls is None:
             parallel_tool_calls = self._opts.parallel_tool_calls
@@ -779,6 +780,13 @@ class LLMStream(llm.LLMStream):
                                     completion_tokens=usage.completion_tokens,
                                     prompt_tokens=usage.prompt_tokens,
                                     total_tokens=usage.total_tokens,
+                                    prompt_tokens_details=(
+                                        llm.CompletionUsage.PromptTokensDetails(
+                                            cached_tokens=usage.prompt_tokens_details.cached_tokens
+                                        )
+                                        if usage.prompt_tokens_details
+                                        else None
+                                    ),
                                 ),
                             )
                         )

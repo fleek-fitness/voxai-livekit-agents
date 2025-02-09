@@ -1,6 +1,10 @@
 from copy import deepcopy
 from dataclasses import dataclass
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 from .base import AgentMetrics, LLMMetrics, STTMetrics, TTSMetrics
 
 
@@ -23,6 +27,15 @@ class UsageCollector:
         if isinstance(metrics, LLMMetrics):
             self._summary.llm_prompt_tokens += metrics.prompt_tokens
             self._summary.llm_completion_tokens += metrics.completion_tokens
+
+            if metrics.prompt_tokens_details:
+                logger.info(f"[prompt_tokens]: {metrics.prompt_tokens}")
+                logger.info(
+                    f"[cached_tokens]: {metrics.prompt_tokens_details.cached_tokens}"
+                )
+                logger.info(
+                    f"[cache_hit_%]: {round(metrics.prompt_tokens_details.cached_tokens/metrics.prompt_tokens, 2)*100}%"
+                )
 
         elif isinstance(metrics, TTSMetrics):
             self._summary.tts_characters_count += metrics.characters_count
