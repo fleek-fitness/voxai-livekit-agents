@@ -925,7 +925,12 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
 
             new_function_calls = llm_stream.function_calls
 
-            self.emit("function_calls_collected", new_function_calls)
+            ###########################################################
+            # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+            if new_function_calls[0].function_info.name != "execute_transition":
+                # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+                ###########################################################
+                self.emit("function_calls_collected", new_function_calls)
 
             called_fncs = []
             for fnc in new_function_calls:
@@ -1008,7 +1013,13 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
 
             if llm_stream is False:
                 # Skip assistant message if callback returns False
-                self.emit("function_calls_finished", called_fncs)
+                ###########################################################
+                # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+                if called_fncs[0].call_info.function_info.name != "execute_transition":
+                    # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+                    ###########################################################
+                    self.emit("function_calls_finished", called_fncs)
+
                 _CallContextVar.reset(tk)
                 return
 
@@ -1029,7 +1040,12 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             )
             speech_handle.add_nested_speech(new_speech_handle)
 
-            self.emit("function_calls_finished", called_fncs)
+            ###########################################################
+            # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+            if called_fncs[0].call_info.function_info.name != "execute_transition":
+                # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+                ###########################################################
+                self.emit("function_calls_finished", called_fncs)
             _CallContextVar.reset(tk)
 
         if not is_using_tools:
@@ -1121,6 +1137,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                 function_name = None
                 accumulated_args = ""
                 last_yielded = ""  # Holds the portion of the value already yielded
+                transition_id = None
                 # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
                 ###########################################################
 
@@ -1133,7 +1150,6 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                         ###########################################################
                         # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
                         if chunk.choices[0].delta.tool_calls:
-                            # tool_calls = getattr(chunk.choices[0].delta, "tool_calls", None)
                             tool_calls = chunk.choices[0].delta.tool_calls
                             if tool_calls:
                                 # Assume one tool call for simplicity.
@@ -1148,6 +1164,64 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                                     and function_name != TARGET_FUNCTION_NAME
                                 ):
                                     continue
+
+                                complete_pattern = (
+                                    r'"transition_id"\s*:\s*"([^"]+)"(?=\s*(,|}))'
+                                )
+                                complete_match = re.search(
+                                    complete_pattern, accumulated_args
+                                )
+                                if complete_match and not transition_id:
+                                    transition_id = complete_match.group(1)
+                                    from livekit.agents.llm.function_context import (
+                                        FunctionCallInfo,
+                                        FunctionInfo,
+                                        CalledFunction,
+                                    )
+
+                                    self.emit(
+                                        "function_calls_collected",
+                                        [
+                                            FunctionCallInfo(
+                                                tool_call_id=tc.id,
+                                                function_info=FunctionInfo(
+                                                    name=function_name,
+                                                    description="",
+                                                    auto_retry=False,
+                                                    callable=None,
+                                                    arguments={},
+                                                ),
+                                                raw_arguments="",
+                                                arguments={
+                                                    "transition_id": transition_id
+                                                },
+                                            )
+                                        ],
+                                    )
+                                    self.emit(
+                                        "function_calls_finished",
+                                        [
+                                            CalledFunction(
+                                                call_info=FunctionCallInfo(
+                                                    tool_call_id=tc.id,
+                                                    function_info=FunctionInfo(
+                                                        name=function_name,
+                                                        description="",
+                                                        auto_retry=False,
+                                                        callable=None,
+                                                        arguments={},
+                                                    ),
+                                                    raw_arguments="",
+                                                    arguments={
+                                                        "transition_id": transition_id
+                                                    },
+                                                ),
+                                                result=None,
+                                                exception=None,
+                                                task=None,
+                                            )
+                                        ],
+                                    )
                                 try:
                                     fragment = tc.function.arguments
                                     if fragment:
@@ -1337,7 +1411,12 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         )
 
         # Emit function_calls_collected event before execution
-        self.emit("function_calls_collected", [call_info])
+        ###########################################################
+        # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+        if call_info.function_info.name != "execute_transition":
+            # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+            ###########################################################
+            self.emit("function_calls_collected", [call_info])
 
         called_fnc = call_info.execute()
         try:
@@ -1345,7 +1424,12 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             result = called_fnc.result
 
             # Emit function_calls_finished event after execution
-            self.emit("function_calls_finished", [called_fnc])
+            ###########################################################
+            # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+            if call_info.function_info.name != "execute_transition":
+                # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+                ###########################################################
+                self.emit("function_calls_finished", [called_fnc])
 
             if speak_result and result is not None:
                 # Create chat context with function result
