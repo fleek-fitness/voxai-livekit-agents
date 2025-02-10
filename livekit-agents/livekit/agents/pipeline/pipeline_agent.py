@@ -1091,13 +1091,93 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         async def _llm_stream_to_str_generator(
             stream: LLMStream,
         ) -> AsyncGenerator[str]:
+
+            ###########################################################
+            # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+            import re
+
+            def extract_partial_value(fragment: str, key: str) -> str | None:
+                """
+                Extracts (even partially) the value associated with a given key from a fragment
+                of JSON-like text. This regex looks for a pattern like:
+                    "rationale_for_execution": "some text...
+                It does not require the JSON to be complete.
+                """
+                # This regex captures whatever follows the key's opening quote until the next quote.
+                pattern = rf'"{re.escape(key)}"\s*:\s*"([^"]*)'
+                match = re.search(pattern, fragment)
+                if match:
+                    return match.group(1)
+                return None
+
+            # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+            ###########################################################
+
             try:
+                ###########################################################
+                # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+                TARGET_FUNCTION_NAME = "execute_transition"
+                TARGET_FUNCTION_ARGUMENT_KEY = "next_transcript"
+                function_name = None
+                accumulated_args = ""
+                last_yielded = ""  # Holds the portion of the value already yielded
+                # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+                ###########################################################
+
                 async for chunk in stream:
                     if not chunk.choices:
                         continue
 
                     content = chunk.choices[0].delta.content
                     if content is None:
+                        ###########################################################
+                        # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+                        if chunk.choices[0].delta.tool_calls:
+                            # tool_calls = getattr(chunk.choices[0].delta, "tool_calls", None)
+                            tool_calls = chunk.choices[0].delta.tool_calls
+                            if tool_calls:
+                                # Assume one tool call for simplicity.
+                                tc = tool_calls[0]
+                                if function_name is None and tc.function.name:
+                                    logger.info(
+                                        f"EXECUTE_TRANSITION_STREAMING ACTIVATED"
+                                    )
+                                    function_name = tc.function.name
+                                if (
+                                    function_name
+                                    and function_name != TARGET_FUNCTION_NAME
+                                ):
+                                    continue
+                                try:
+                                    fragment = tc.function.arguments
+                                    if fragment:
+                                        # Accumulate the argument fragments.
+                                        accumulated_args += fragment
+                                        # Extract the (partial) value for the target key.
+                                        partial_value = extract_partial_value(
+                                            accumulated_args,
+                                            TARGET_FUNCTION_ARGUMENT_KEY,
+                                        )
+                                        if partial_value is not None:
+                                            # Compute the delta: the extra portion that hasn't been yielded yet.
+                                            if partial_value.startswith(last_yielded):
+                                                delta = partial_value[
+                                                    len(last_yielded) :
+                                                ]
+                                            else:
+                                                # If the new value doesn't start with the previous yield,
+                                                # yield the whole new value (or handle it differently as needed).
+                                                delta = partial_value
+
+                                            if delta:
+                                                yield delta
+                                            # Update the last_yielded with the current extracted value.
+                                            last_yielded = partial_value
+                                except Exception as e:
+                                    continue
+                        # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+                        ###########################################################
+
                         continue
 
                     yield content

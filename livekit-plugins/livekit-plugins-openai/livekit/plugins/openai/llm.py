@@ -832,6 +832,15 @@ class LLMStream(llm.LLMStream):
                 if call_chunk is not None:
                     return call_chunk
 
+            ###########################################################
+            # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+            return llm.ChatChunk(
+                request_id=id,
+                choices=[choice],
+            )
+            # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+            ###########################################################
+
         if choice.finish_reason in ("tool_calls", "stop") and self._tool_call_id:
             # we're done with the tool calls, run the last one
             return self._try_build_function(id, choice)
