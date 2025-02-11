@@ -1445,10 +1445,12 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         if call_info.function_info.name != "execute_transition":
             # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
             ###########################################################
-            self.emit("function_calls_collected", [call_info])
+            pass
+        self.emit("function_calls_collected", [call_info])
 
         called_fnc = call_info.execute()
         try:
+            logger.info(2)
             await called_fnc.task
             result = called_fnc.result
 
@@ -1458,7 +1460,8 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             if call_info.function_info.name != "execute_transition":
                 # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
                 ###########################################################
-                self.emit("function_calls_finished", [called_fnc])
+                pass
+            self.emit("function_calls_finished", [called_fnc])
 
             if speak_result and result is not None:
                 # Create chat context with function result
