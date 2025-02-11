@@ -2521,25 +2521,34 @@ class FlowVoicePipelineAgent(utils.EventEmitter[EventTypes]):
                                         ],
                                     )
                                 # Now look for partial transcripts in "next_transcript"
-                                fragment = tc.function.arguments or ""
-                                accumulated_args += fragment
+                                try:
+                                    fragment = tc.function.arguments or ""
+                                    if fragment:
+                                        accumulated_args += fragment
 
-                                partial_value = extract_partial_value(
-                                    accumulated_args, TARGET_FUNCTION_ARGUMENT_KEY
-                                )
-                                if partial_value is not None:
-                                    # Decide whether to yield the new substring (like a "delta" approach)
-                                    if (
-                                        node_type == "conversation"
-                                        and prompt_type == "dynamic"
-                                    ):
-                                        if partial_value.startswith(last_yielded):
-                                            delta = partial_value[len(last_yielded) :]
-                                        else:
-                                            delta = partial_value
-                                        if delta:
-                                            yield delta
-                                        last_yielded = partial_value
+                                        partial_value = extract_partial_value(
+                                            accumulated_args,
+                                            TARGET_FUNCTION_ARGUMENT_KEY,
+                                        )
+                                        if partial_value is not None:
+                                            # Decide whether to yield the new substring (like a "delta" approach)
+                                            if (
+                                                node_type == "conversation"
+                                                and prompt_type == "dynamic"
+                                            ):
+                                                if partial_value.startswith(
+                                                    last_yielded
+                                                ):
+                                                    delta = partial_value[
+                                                        len(last_yielded) :
+                                                    ]
+                                                else:
+                                                    delta = partial_value
+                                                if delta:
+                                                    yield delta
+                                                last_yielded = partial_value
+                                except Exception as e:
+                                    continue
                         # END VOXAI_NATIVE_CODE
                         continue
                     yield content
