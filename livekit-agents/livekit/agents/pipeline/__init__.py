@@ -3,11 +3,9 @@ from .pipeline_agent import (
     AgentTranscriptionOptions,
     VoicePipelineAgent,
 )
-from .flow_pipeline_agent import FlowVoicePipelineAgent
 
 __all__ = [
     "VoicePipelineAgent",
-    "FlowVoicePipelineAgent",
     "AgentCallContext",
     "AgentTranscriptionOptions",
 ]
