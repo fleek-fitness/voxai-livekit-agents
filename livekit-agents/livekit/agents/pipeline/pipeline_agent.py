@@ -2413,6 +2413,8 @@ class FlowVoicePipelineAgent(utils.EventEmitter[EventTypes]):
             TARGET_FUNCTION_ARGUMENT_KEY = "next_transcript"
 
             # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+            import re
+
             def extract_partial_value(fragment: str, key: str) -> str | None:
                 pattern = rf'"{key}"\s*:\s*"([^"]*)'
                 match = re.search(pattern, fragment)
@@ -2467,6 +2469,11 @@ class FlowVoicePipelineAgent(utils.EventEmitter[EventTypes]):
                                         self._prompt_type_after_transition.get(
                                             transition_id, None
                                         )
+                                    )
+                                    from livekit.agents.llm.function_context import (
+                                        FunctionCallInfo,
+                                        FunctionInfo,
+                                        CalledFunction,
                                     )
 
                                     # Emit function_calls_collected / finished for partial calls
