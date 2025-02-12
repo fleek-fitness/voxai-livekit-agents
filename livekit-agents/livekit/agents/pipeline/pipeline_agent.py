@@ -881,6 +881,10 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                     elif speech_handle.extra_tools_messages[0].tool_calls:
                         # remove the content of the tool call message
                         speech_handle.extra_tools_messages[0].content = ""
+
+                logger.info(f"----------------------------------------------------")
+                logger.info(f"EXTRA TOOL CALLS MESSAGE APPENDED")
+                logger.info(f"----------------------------------------------------")
                 self._chat_ctx.messages.extend(speech_handle.extra_tools_messages)
 
             if collected_text:
@@ -1258,6 +1262,9 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                                         if partial_value is not None:
                                             if (
                                                 node_type == "conversation"
+                                                and prompt_type == "dynamic"
+                                            ) or (
+                                                node_type == "function"
                                                 and prompt_type == "dynamic"
                                             ):
                                                 # Compute the delta: the extra portion that hasn't been yielded yet.
