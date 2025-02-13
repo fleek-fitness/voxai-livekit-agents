@@ -1557,6 +1557,12 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             raise
 
 
+class FlowVoicePipelineAgent(VoicePipelineAgent):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.flow_mode_enabled = True  # Custom attribute
+
+
 class _DeferredReplyValidation:
     """This class is used to try to find the best time to validate the agent reply."""
 
