@@ -1190,127 +1190,127 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
 
                     content = chunk.choices[0].delta.content
                     if content is None:
-                        ###########################################################
-                        # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
-                        if chunk.choices[0].delta.tool_calls:
-                            tool_calls = chunk.choices[0].delta.tool_calls
-                            if tool_calls:
-                                # Assume one tool call for simplicity.
-                                tc = tool_calls[0]
-                                if function_name is None and tc.function.name:
-                                    logger.info(
-                                        f"EXECUTE_TRANSITION_STREAMING ACTIVATED"
-                                    )
-                                    function_name = tc.function.name
-                                if (
-                                    function_name
-                                    and function_name != TARGET_FUNCTION_NAME
-                                ):
-                                    continue
+                        # ###########################################################
+                        # # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+                        # if chunk.choices[0].delta.tool_calls:
+                        #     tool_calls = chunk.choices[0].delta.tool_calls
+                        #     if tool_calls:
+                        #         # Assume one tool call for simplicity.
+                        #         tc = tool_calls[0]
+                        #         if function_name is None and tc.function.name:
+                        #             logger.info(
+                        #                 f"EXECUTE_TRANSITION_STREAMING ACTIVATED"
+                        #             )
+                        #             function_name = tc.function.name
+                        #         if (
+                        #             function_name
+                        #             and function_name != TARGET_FUNCTION_NAME
+                        #         ):
+                        #             continue
 
-                                complete_pattern = (
-                                    r'"transition_id"\s*:\s*"([^"]+)"(?=\s*(,|}))'
-                                )
-                                complete_match = re.search(
-                                    complete_pattern, accumulated_args
-                                )
-                                if complete_match and not transition_id:
-                                    transition_id = complete_match.group(1)
-                                    node_type = self._node_type_after_transition.get(
-                                        transition_id, None
-                                    )
-                                    prompt_type = (
-                                        self._prompt_type_after_transition.get(
-                                            transition_id, None
-                                        )
-                                    )
-                                    from livekit.agents.llm.function_context import (
-                                        FunctionCallInfo,
-                                        FunctionInfo,
-                                        CalledFunction,
-                                    )
+                        #         complete_pattern = (
+                        #             r'"transition_id"\s*:\s*"([^"]+)"(?=\s*(,|}))'
+                        #         )
+                        #         complete_match = re.search(
+                        #             complete_pattern, accumulated_args
+                        #         )
+                        #         if complete_match and not transition_id:
+                        #             transition_id = complete_match.group(1)
+                        #             node_type = self._node_type_after_transition.get(
+                        #                 transition_id, None
+                        #             )
+                        #             prompt_type = (
+                        #                 self._prompt_type_after_transition.get(
+                        #                     transition_id, None
+                        #                 )
+                        #             )
+                        #             from livekit.agents.llm.function_context import (
+                        #                 FunctionCallInfo,
+                        #                 FunctionInfo,
+                        #                 CalledFunction,
+                        #             )
 
-                                    self.emit(
-                                        "function_calls_collected",
-                                        [
-                                            FunctionCallInfo(
-                                                tool_call_id=tc.id,
-                                                function_info=FunctionInfo(
-                                                    name=function_name,
-                                                    description="",
-                                                    auto_retry=False,
-                                                    callable=None,
-                                                    arguments={},
-                                                ),
-                                                raw_arguments="",
-                                                arguments={
-                                                    "transition_id": transition_id
-                                                },
-                                            )
-                                        ],
-                                    )
-                                    self.emit(
-                                        "function_calls_finished",
-                                        [
-                                            CalledFunction(
-                                                call_info=FunctionCallInfo(
-                                                    tool_call_id=tc.id,
-                                                    function_info=FunctionInfo(
-                                                        name=function_name,
-                                                        description="",
-                                                        auto_retry=False,
-                                                        callable=None,
-                                                        arguments={},
-                                                    ),
-                                                    raw_arguments="",
-                                                    arguments={
-                                                        "transition_id": transition_id
-                                                    },
-                                                ),
-                                                result=None,
-                                                exception=None,
-                                                task=None,
-                                            )
-                                        ],
-                                    )
-                                try:
-                                    fragment = tc.function.arguments
-                                    if fragment:
-                                        # Accumulate the argument fragments.
-                                        accumulated_args += fragment
-                                        # Extract the (partial) value for the target key.
-                                        partial_value = extract_partial_value(
-                                            accumulated_args,
-                                            TARGET_FUNCTION_ARGUMENT_KEY,
-                                        )
-                                        if partial_value is not None:
-                                            if (
-                                                node_type == "conversation"
-                                                and prompt_type == "dynamic"
-                                            ) or (
-                                                node_type == "function"
-                                                and prompt_type == "dynamic"
-                                            ):
-                                                # Compute the delta: the extra portion that hasn't been yielded yet.
-                                                if partial_value.startswith(
-                                                    last_yielded
-                                                ):
-                                                    delta = partial_value[
-                                                        len(last_yielded) :
-                                                    ]
-                                                else:
-                                                    # If the new value doesn't start with the previous yield,
-                                                    # yield the whole new value (or handle it differently as needed).
-                                                    delta = partial_value
+                        #             self.emit(
+                        #                 "function_calls_collected",
+                        #                 [
+                        #                     FunctionCallInfo(
+                        #                         tool_call_id=tc.id,
+                        #                         function_info=FunctionInfo(
+                        #                             name=function_name,
+                        #                             description="",
+                        #                             auto_retry=False,
+                        #                             callable=None,
+                        #                             arguments={},
+                        #                         ),
+                        #                         raw_arguments="",
+                        #                         arguments={
+                        #                             "transition_id": transition_id
+                        #                         },
+                        #                     )
+                        #                 ],
+                        #             )
+                        #             self.emit(
+                        #                 "function_calls_finished",
+                        #                 [
+                        #                     CalledFunction(
+                        #                         call_info=FunctionCallInfo(
+                        #                             tool_call_id=tc.id,
+                        #                             function_info=FunctionInfo(
+                        #                                 name=function_name,
+                        #                                 description="",
+                        #                                 auto_retry=False,
+                        #                                 callable=None,
+                        #                                 arguments={},
+                        #                             ),
+                        #                             raw_arguments="",
+                        #                             arguments={
+                        #                                 "transition_id": transition_id
+                        #                             },
+                        #                         ),
+                        #                         result=None,
+                        #                         exception=None,
+                        #                         task=None,
+                        #                     )
+                        #                 ],
+                        #             )
+                        #         try:
+                        #             fragment = tc.function.arguments
+                        #             if fragment:
+                        #                 # Accumulate the argument fragments.
+                        #                 accumulated_args += fragment
+                        #                 # Extract the (partial) value for the target key.
+                        #                 partial_value = extract_partial_value(
+                        #                     accumulated_args,
+                        #                     TARGET_FUNCTION_ARGUMENT_KEY,
+                        #                 )
+                        #                 if partial_value is not None:
+                        #                     if (
+                        #                         node_type == "conversation"
+                        #                         and prompt_type == "dynamic"
+                        #                     ) or (
+                        #                         node_type == "function"
+                        #                         and prompt_type == "dynamic"
+                        #                     ):
+                        #                         # Compute the delta: the extra portion that hasn't been yielded yet.
+                        #                         if partial_value.startswith(
+                        #                             last_yielded
+                        #                         ):
+                        #                             delta = partial_value[
+                        #                                 len(last_yielded) :
+                        #                             ]
+                        #                         else:
+                        #                             # If the new value doesn't start with the previous yield,
+                        #                             # yield the whole new value (or handle it differently as needed).
+                        #                             delta = partial_value
 
-                                                if delta:
-                                                    yield delta
-                                                # Update the last_yielded with the current extracted value.
-                                                last_yielded = partial_value
-                                except Exception as e:
-                                    continue
-                        # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
-                        ###########################################################
+                        #                         if delta:
+                        #                             yield delta
+                        #                         # Update the last_yielded with the current extracted value.
+                        #                         last_yielded = partial_value
+                        #         except Exception as e:
+                        #             continue
+                        # # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
+                        # ###########################################################
 
                         continue
 
