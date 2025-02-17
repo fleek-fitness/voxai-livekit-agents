@@ -140,13 +140,9 @@ class STT(stt.STT):
         the ``GROQ_API_KEY`` environmental variable.
         """
 
-        api_key = api_key or os.environ.get("GROQ_API_KEY")
-        if api_key is None:
-            raise ValueError("Groq API key is required")
-
         return STT(
             model="whisper-large-v3-turbo",
-            api_key=api_key,
+            api_key=None,
             base_url=base_url,
             client=client,
             language=language,
