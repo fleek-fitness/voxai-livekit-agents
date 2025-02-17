@@ -125,6 +125,34 @@ class STT(stt.STT):
             detect_language=detect_language,
         )
 
+    @staticmethod
+    def with_voxai(
+        *,
+        base_url: str,
+        client: openai.AsyncClient | None = None,
+        language: str = "en",
+        detect_language: bool = False,
+    ) -> STT:
+        """
+        Create a new instance of Groq STT.
+
+        ``api_key`` must be set to your Groq API key, either using the argument or by setting
+        the ``GROQ_API_KEY`` environmental variable.
+        """
+
+        api_key = api_key or os.environ.get("GROQ_API_KEY")
+        if api_key is None:
+            raise ValueError("Groq API key is required")
+
+        return STT(
+            model="whisper-large-v3-turbo",
+            api_key=api_key,
+            base_url=base_url,
+            client=client,
+            language=language,
+            detect_language=detect_language,
+        )
+
     def _sanitize_options(self, *, language: str | None = None) -> _STTOptions:
         config = dataclasses.replace(self._opts)
         config.language = language or config.language
