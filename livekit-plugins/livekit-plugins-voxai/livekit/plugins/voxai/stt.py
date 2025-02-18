@@ -108,9 +108,8 @@ class SpeechStream(stt.SpeechStream):
     ):
         super().__init__(stt=stt, conn_options=conn_options, sample_rate=sample_rate)
         self.language = language
-        # For demonstration, we assign a dummy VAD stream. Replace with your real VAD source.
         self._vad = vad
-        self._vad_stream: AsyncIterable[VADEvent] = self._vad.stream()
+        self._vad_stream = None  # Initialize as None, create in _run
 
     async def _dummy_vad_stream(self) -> AsyncIterable[VADEvent]:
         """
@@ -124,6 +123,7 @@ class SpeechStream(stt.SpeechStream):
 
     async def _run(self) -> None:
         closing_ws = False
+        self._vad_stream = self._vad.stream()
 
         async def keepalive_task(ws: aiohttp.ClientWebSocketResponse):
             try:
