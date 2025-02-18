@@ -49,11 +49,18 @@ class STT(stt.STT):
     (The _recognize_impl method is omitted for brevity.)
     """
 
-    def __init__(self, uri: str, *, capabilities: stt.STTCapabilities | None = None):
+    def __init__(
+        self,
+        uri: str,
+        vad: vad.VAD,
+        *,
+        capabilities: stt.STTCapabilities | None = None,
+    ):
         if capabilities is None:
             capabilities = stt.STTCapabilities(streaming=True, interim_results=True)
         super().__init__(capabilities=capabilities)
         self.uri = uri
+        self._vad = vad
 
     def stream(
         self,
@@ -64,6 +71,7 @@ class STT(stt.STT):
     ) -> SpeechStream:
         return SpeechStream(
             stt=self,
+            vad=self._vad,
             conn_options=conn_options,
             sample_rate=sample_rate,
             language=language,
@@ -93,6 +101,7 @@ class SpeechStream(stt.SpeechStream):
         self,
         *,
         stt: STT,
+        vad: vad.VAD,
         conn_options: APIConnectOptions,
         sample_rate: int | None = None,
         language: str | None = None,
@@ -100,7 +109,8 @@ class SpeechStream(stt.SpeechStream):
         super().__init__(stt=stt, conn_options=conn_options, sample_rate=sample_rate)
         self.language = language
         # For demonstration, we assign a dummy VAD stream. Replace with your real VAD source.
-        self._vad_stream: AsyncIterable[VADEvent] = self._dummy_vad_stream()
+        self._vad = vad
+        self._vad_stream: AsyncIterable[VADEvent] = self._vad.stream()
 
     async def _dummy_vad_stream(self) -> AsyncIterable[VADEvent]:
         """
