@@ -35,11 +35,9 @@ from livekit.agents.stt import SpeechData, SpeechEvent, SpeechEventType
 from livekit.agents.vad import VADEventType, VADEvent
 
 # Message constants (example values)
-# _KEEPALIVE_MSG = '{"type": "keepalive"}'
-# _FINALIZE_MSG = '{"type": "finalize"}'
-# _CLOSE_MSG = '{"type": "close"}'
 _KEEPALIVE_MSG = "KEEPALIVE"
 _FINALIZE_MSG = "FINALIZE"
+_START_MSG = "START"
 _CLOSE_MSG = "CLOSE"
 
 
@@ -122,6 +120,16 @@ class SpeechStream(stt.SpeechStream):
         yield VADEvent(type=VADEventType.END_OF_SPEECH)
 
     async def _run(self) -> None:
+        async def _forward_input():
+            """forward input to vad"""
+            async for input in self._input_ch:
+                if isinstance(input, self._FlushSentinel):
+                    self._vad_stream.flush()
+                    continue
+                self._vad_stream.push_frame(input)
+
+            self._vad_stream.end_input()
+
         closing_ws = False
         self._vad_stream = self._vad.stream()
 
@@ -142,7 +150,8 @@ class SpeechStream(stt.SpeechStream):
                 elif data is None:
                     break
                 else:
-                    await ws.send_bytes(data.data)
+                    if data.data is not None:
+                        await ws.send_bytes(data.data.tobytes())
             closing_ws = True
             await ws.send_str(_CLOSE_MSG)
 
@@ -157,7 +166,7 @@ class SpeechStream(stt.SpeechStream):
                 ):
                     if closing_ws:
                         return
-                    raise APIError("Websocket closed unexpectedly", body=None)
+                    raise Exception("Websocket closed unexpectedly")
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     continue
                 try:
@@ -178,8 +187,8 @@ class SpeechStream(stt.SpeechStream):
                                 )
                             ],
                         )
-                        self._event_ch.put_nowait(event)
-                        break  # Final transcript received; exit recv loop.
+                        self._event_ch.send_nowait(event)
+                        # break  # Final transcript received; exit recv loop.
                     else:
                         event = SpeechEvent(
                             type=SpeechEventType.INTERIM_TRANSCRIPT,
@@ -193,7 +202,7 @@ class SpeechStream(stt.SpeechStream):
                                 )
                             ],
                         )
-                        self._event_ch.put_nowait(event)
+                        self._event_ch.send_nowait(event)
                 except Exception as e:
                     print("Failed to process message:", e)
                     continue
@@ -202,15 +211,16 @@ class SpeechStream(stt.SpeechStream):
             # Process VAD events and forward them as SpeechEvents.
             async for vad_event in self._vad_stream:
                 if vad_event.type == VADEventType.START_OF_SPEECH:
-                    self._event_ch.put_nowait(
+                    await ws.send_str(_START_MSG)
+                    self._event_ch.send_nowait(
                         SpeechEvent(type=SpeechEventType.START_OF_SPEECH)
                     )
                 elif vad_event.type == VADEventType.END_OF_SPEECH:
-                    self._event_ch.put_nowait(
+                    await ws.send_str(_FINALIZE_MSG)
+                    self._event_ch.send_nowait(
                         SpeechEvent(type=SpeechEventType.END_OF_SPEECH)
                     )
                     # When end-of-speech is detected by VAD, send the finalize message.
-                    await ws.send_str(_FINALIZE_MSG)
 
         ws: aiohttp.ClientWebSocketResponse | None = None
         while True:
@@ -220,6 +230,7 @@ class SpeechStream(stt.SpeechStream):
                         self._stt.uri, timeout=self._conn_options.timeout
                     ) as ws:
                         tasks = [
+                            asyncio.create_task(_forward_input()),
                             asyncio.create_task(send_task(ws)),
                             asyncio.create_task(recv_task(ws)),
                             asyncio.create_task(keepalive_task(ws)),
