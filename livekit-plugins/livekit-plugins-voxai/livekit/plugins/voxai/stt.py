@@ -147,7 +147,7 @@ class SpeechStream(stt.SpeechStream):
                 ):
                     if closing_ws:
                         return
-                    raise APIError("Websocket closed unexpectedly")
+                    raise APIError("Websocket closed unexpectedly", body=None)
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     continue
                 try:
