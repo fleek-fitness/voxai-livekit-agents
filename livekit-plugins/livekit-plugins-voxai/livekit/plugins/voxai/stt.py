@@ -132,7 +132,7 @@ class SpeechStream(stt.SpeechStream):
                 elif data is None:
                     break
                 else:
-                    await ws.send_bytes(data)
+                    await ws.send_bytes(data.data)
             closing_ws = True
             await ws.send_str(_CLOSE_MSG)
 
