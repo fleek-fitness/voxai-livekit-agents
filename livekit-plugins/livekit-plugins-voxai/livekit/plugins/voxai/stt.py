@@ -30,8 +30,9 @@ from livekit.agents import (
     utils,
     vad,
 )
+from livekit.agents.utils import AudioBuffer
 from livekit.agents.stt import SpeechData, SpeechEvent, SpeechEventType
-from livekit.agents.vad import VADEventType, VADStreamEvent
+from livekit.agents.vad import VADEventType, VADEvent
 
 # Message constants (example values)
 # _KEEPALIVE_MSG = '{"type": "keepalive"}'
@@ -69,6 +70,14 @@ class STT(stt.STT):
         )
 
     # _recognize_impl for non-streaming is omitted for brevity.
+    async def _recognize_impl(
+        self,
+        buffer: AudioBuffer,
+        *,
+        language: str | None = None,
+        conn_options: APIConnectOptions,
+    ) -> SpeechEvent:
+        pass
 
 
 class SpeechStream(stt.SpeechStream):
@@ -91,17 +100,17 @@ class SpeechStream(stt.SpeechStream):
         super().__init__(stt=stt, conn_options=conn_options, sample_rate=sample_rate)
         self.language = language
         # For demonstration, we assign a dummy VAD stream. Replace with your real VAD source.
-        self._vad_stream: AsyncIterable[VADStreamEvent] = self._dummy_vad_stream()
+        self._vad_stream: AsyncIterable[VADEvent] = self._dummy_vad_stream()
 
-    async def _dummy_vad_stream(self) -> AsyncIterable[VADStreamEvent]:
+    async def _dummy_vad_stream(self) -> AsyncIterable[VADEvent]:
         """
         Dummy VAD stream for demonstration.
         Replace this with your actual VAD event source.
         """
         await asyncio.sleep(1)
-        yield VADStreamEvent(type=VADEventType.START_OF_SPEECH)
+        yield VADEvent(type=VADEventType.START_OF_SPEECH)
         await asyncio.sleep(3)
-        yield VADStreamEvent(type=VADEventType.END_OF_SPEECH)
+        yield VADEvent(type=VADEventType.END_OF_SPEECH)
 
     async def _run(self) -> None:
         closing_ws = False
