@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .stt import STT
 from .version import __version__
 
-__all__ = ["__version__"]
+__all__ = ["STT", "__version__"]
 
 from livekit.agents import Plugin
 
