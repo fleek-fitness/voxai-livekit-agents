@@ -785,7 +785,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                     ]
                 handle.cancel()
                 return
-            if llm_stream is "FALSE_BUT_RETAIN_TRANSCRIPT":
+            if llm_stream == "FALSE_BUT_RETAIN_TRANSCRIPT":
                 handle.cancel()
                 return
 
