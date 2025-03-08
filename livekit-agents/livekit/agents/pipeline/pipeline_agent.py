@@ -785,6 +785,9 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                     ]
                 handle.cancel()
                 return
+            if llm_stream is "FALSE_BUT_RETAIN_TRANSCRIPT":
+                handle.cancel()
+                return
 
             # fallback to default impl if no custom/user stream is returned
             if not isinstance(llm_stream, LLMStream):
