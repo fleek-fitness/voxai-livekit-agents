@@ -38,6 +38,7 @@ from .models import GroqAudioModels, WhisperModels
 class _STTOptions:
     language: str
     detect_language: bool
+    prompt: str | None
     model: WhisperModels | str
 
 
@@ -51,6 +52,7 @@ class STT(stt.STT):
         base_url: str | None = None,
         api_key: str | None = None,
         client: openai.AsyncClient | None = None,
+        prompt: str | None = None,
     ):
         """
         Create a new instance of OpenAI STT.
@@ -69,6 +71,7 @@ class STT(stt.STT):
             language=language,
             detect_language=detect_language,
             model=model,
+            prompt=prompt,
         )
 
         self._client = client or openai.AsyncClient(
@@ -104,6 +107,7 @@ class STT(stt.STT):
         client: openai.AsyncClient | None = None,
         language: str = "en",
         detect_language: bool = False,
+        prompt: str | None = None,
     ) -> STT:
         """
         Create a new instance of Groq STT.
@@ -123,6 +127,7 @@ class STT(stt.STT):
             client=client,
             language=language,
             detect_language=detect_language,
+            prompt=prompt,
         )
 
     @staticmethod
@@ -172,6 +177,7 @@ class STT(stt.STT):
                 ),
                 model=self._opts.model,
                 language=config.language,
+                prompt=self._opts.prompt,
                 # verbose_json returns language and other details
                 response_format="verbose_json",
                 timeout=httpx.Timeout(30, connect=conn_options.timeout),

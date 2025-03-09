@@ -1444,7 +1444,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         self._speech_q.append(speech_handle)
         self._speech_q_changed.set()
 
-    async def trigger_followup_response(self):
+    async def trigger_followup_response(self) -> SpeechHandle | None:
         # Create a copy of the chat context
         copied_ctx = self.chat_ctx.copy()
 
@@ -1463,6 +1463,8 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         synthesis_handle = self._synthesize_agent_speech(speech_handle.id, llm_stream)
         speech_handle.initialize(source=llm_stream, synthesis_handle=synthesis_handle)
         self._add_speech_for_playout(speech_handle)
+
+        return speech_handle
 
     async def execute_function_directly(
         self, function_name: str, arguments: dict, speak_result: bool = True
