@@ -40,6 +40,7 @@ class _STTOptions:
     detect_language: bool
     prompt: str | None
     model: WhisperModels | str
+    temperature: float
 
 
 class STT(stt.STT):
@@ -53,6 +54,7 @@ class STT(stt.STT):
         api_key: str | None = None,
         client: openai.AsyncClient | None = None,
         prompt: str | None = None,
+        temperature: float = 0.0,
     ):
         """
         Create a new instance of OpenAI STT.
@@ -72,6 +74,7 @@ class STT(stt.STT):
             detect_language=detect_language,
             model=model,
             prompt=prompt,
+            temperature=temperature,
         )
 
         self._client = client or openai.AsyncClient(
@@ -108,6 +111,7 @@ class STT(stt.STT):
         language: str = "en",
         detect_language: bool = False,
         prompt: str | None = None,
+        temperature: float = 0.0,
     ) -> STT:
         """
         Create a new instance of Groq STT.
@@ -128,6 +132,7 @@ class STT(stt.STT):
             language=language,
             detect_language=detect_language,
             prompt=prompt,
+            temperature=temperature,
         )
 
     @staticmethod
@@ -178,6 +183,7 @@ class STT(stt.STT):
                 model=self._opts.model,
                 language=config.language,
                 prompt=self._opts.prompt,
+                temperature=self._opts.temperature,
                 # verbose_json returns language and other details
                 response_format="verbose_json",
                 timeout=httpx.Timeout(30, connect=conn_options.timeout),
