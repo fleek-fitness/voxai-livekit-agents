@@ -1132,7 +1132,8 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             logger.debug(
                 "cancelling function calls task", extra={"speech_id": speech_handle.id}
             )
-            fnc_task.cancel()
+            # VOXAI_NATIVE_CODE: DO NOT CANCEL THE TASK
+            # fnc_task.cancel()
 
         # mark the speech as done
         speech_handle._set_done()

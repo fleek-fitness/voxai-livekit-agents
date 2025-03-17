@@ -155,7 +155,8 @@ class SpeechHandle:
     @synthesis_handle.setter
     def synthesis_handle(self, synthesis_handle: SynthesisHandle) -> None:
         """synthesis handle can be replaced for the same speech.
-        This is useful when we need to do a new generation. (e.g for automatic function call answers)"""
+        This is useful when we need to do a new generation. (e.g for automatic function call answers)
+        """
         if self._synthesis_handle is None:
             raise RuntimeError("speech not initialized")
 
@@ -194,10 +195,19 @@ class SpeechHandle:
         self._init_fut.cancel()
 
         if self._synthesis_handle is not None:
-            self._synthesis_handle.interrupt()
+            # VOXAI_NATIVE_CODE: INTERRUPT ONLY allow_interruptions is True
+            if self.allow_interruptions:
+                self._synthesis_handle.interrupt()
+
+            # self._synthesis_handle.interrupt()
 
         if cancel_nested:
             for speech in self._nested_speech_handles:
+                # VOXAI_NATIVE_CODE: INTERRUPT ONLY allow_interruptions is True
+                if speech.allow_interruptions:
+                    speech.interrupt()
+
+                # speech.interrupt()
                 speech.cancel(cancel_nested=True)
             self.mark_nested_speech_done()
 
