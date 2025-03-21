@@ -40,11 +40,8 @@ class _STTOptions:
     detect_language: bool
     prompt: str | None
     model: WhisperModels | str
-<<<<<<< HEAD
     temperature: float
-=======
     prompt: str | None = None
->>>>>>> b7b480b2250842dc1cc03f68c9a5c47783c20c62
 
 
 class STT(stt.STT):
@@ -58,7 +55,6 @@ class STT(stt.STT):
         base_url: str | None = None,
         api_key: str | None = None,
         client: openai.AsyncClient | None = None,
-        prompt: str | None = None,
         temperature: float = 0.0,
     ):
         """
@@ -79,10 +75,7 @@ class STT(stt.STT):
             detect_language=detect_language,
             model=model,
             prompt=prompt,
-<<<<<<< HEAD
             temperature=temperature,
-=======
->>>>>>> b7b480b2250842dc1cc03f68c9a5c47783c20c62
         )
 
         self._client = client or openai.AsyncClient(
@@ -121,7 +114,6 @@ class STT(stt.STT):
         language: str = "en",
         prompt: str | None = None,
         detect_language: bool = False,
-        prompt: str | None = None,
         temperature: float = 0.0,
     ) -> STT:
         """
@@ -143,7 +135,6 @@ class STT(stt.STT):
             language=language,
             detect_language=detect_language,
             prompt=prompt,
-<<<<<<< HEAD
             temperature=temperature,
         )
 
@@ -169,8 +160,6 @@ class STT(stt.STT):
             client=client,
             language=language,
             detect_language=detect_language,
-=======
->>>>>>> b7b480b2250842dc1cc03f68c9a5c47783c20c62
         )
 
     def _sanitize_options(self, *, language: str | None = None) -> _STTOptions:
@@ -199,12 +188,8 @@ class STT(stt.STT):
                 ),
                 model=self._opts.model,
                 language=config.language,
-<<<<<<< HEAD
                 prompt=self._opts.prompt,
                 temperature=self._opts.temperature,
-=======
-                prompt=prompt,
->>>>>>> b7b480b2250842dc1cc03f68c9a5c47783c20c62
                 # verbose_json returns language and other details
                 response_format="verbose_json",
                 timeout=httpx.Timeout(30, connect=conn_options.timeout),

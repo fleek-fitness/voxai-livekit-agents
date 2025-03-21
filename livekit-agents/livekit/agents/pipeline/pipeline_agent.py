@@ -324,16 +324,13 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         self._last_final_transcript_time: float | None = None
         self._last_speech_time: float | None = None
 
-<<<<<<< HEAD
         ###########################################################
         # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
         self._node_type_after_transition = node_type_after_transition
         self._prompt_type_after_transition = prompt_type_after_transition
         # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
         ###########################################################
-=======
         self._noise_cancellation = noise_cancellation
->>>>>>> b7b480b2250842dc1cc03f68c9a5c47783c20c62
 
     @property
     def fnc_ctx(self) -> FunctionContext | None:
