@@ -38,7 +38,6 @@ from .models import GroqAudioModels, WhisperModels
 class _STTOptions:
     language: str
     detect_language: bool
-    prompt: str | None
     model: WhisperModels | str
     temperature: float
     prompt: str | None = None
@@ -74,7 +73,6 @@ class STT(stt.STT):
             language=language,
             detect_language=detect_language,
             model=model,
-            prompt=prompt,
             temperature=temperature,
         )
 
