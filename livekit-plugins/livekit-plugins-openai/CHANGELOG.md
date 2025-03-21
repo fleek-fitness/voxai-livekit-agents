@@ -1,5 +1,51 @@
 # livekit-plugins-openai
 
+## 0.11.3
+
+### Patch Changes
+
+- Support more input transcription parameters for openai realtime - [#1637](https://github.com/livekit/agents/pull/1637) ([@adambenali](https://github.com/adambenali))
+
+- Add string type support to model parameter - [#1657](https://github.com/livekit/agents/pull/1657) ([@jayeshp19](https://github.com/jayeshp19))
+
+## 0.11.2
+
+### Patch Changes
+
+- version bump to 0.11.1 - [#1640](https://github.com/livekit/agents/pull/1640) ([@davidzhao](https://github.com/davidzhao))
+
+## 1.0.1
+
+### Patch Changes
+
+- use streaming AudioDecoder to handle compressed encoding - [#1584](https://github.com/livekit/agents/pull/1584) ([@davidzhao](https://github.com/davidzhao))
+
+- fix multimodal agent interrupts itself when creating function call response - [#1585](https://github.com/livekit/agents/pull/1585) ([@longcw](https://github.com/longcw))
+
+- feat: add max_tokens option to LLM and LLMStream classes - [#1576](https://github.com/livekit/agents/pull/1576) ([@davidzhao](https://github.com/davidzhao))
+
+- updated livekit-agent reference to <1.0 - [#1607](https://github.com/livekit/agents/pull/1607) ([@davidzhao](https://github.com/davidzhao))
+
+## 1.0.0
+
+### Major Changes
+
+- feat: add max_tokens option to LLM and LLMStream classes - [#1545](https://github.com/livekit/agents/pull/1545) ([@dorlanpabon](https://github.com/dorlanpabon))
+
+## 0.11.0
+
+### Minor Changes
+
+- openai tts: switch to using Opus encoding - [#1494](https://github.com/livekit/agents/pull/1494) ([@davidzhao](https://github.com/davidzhao))
+
+## 0.10.19
+
+### Patch Changes
+
+- fix: [openai] only send params when set - [#1474](https://github.com/livekit/agents/pull/1474) ([@jayeshp19](https://github.com/jayeshp19))
+
+- fix response create for openai realtime model - [#1469](https://github.com/livekit/agents/pull/1469) ([@longcw](https://github.com/longcw))
+
 ## 0.10.18
 
 ### Patch Changes

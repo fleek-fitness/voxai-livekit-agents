@@ -14,11 +14,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+from typing import Optional
 
 import httpx
 from livekit.agents import (
-    DEFAULT_API_CONNECT_OPTIONS,
     APIConnectionError,
     APIConnectOptions,
     APIStatusError,
@@ -29,10 +30,11 @@ from livekit.agents import (
 
 import openai
 
+from .log import logger
 from .models import TTSModels, TTSVoices
 from .utils import AsyncAzureADTokenProvider
 
-OPENAI_TTS_SAMPLE_RATE = 24000
+OPENAI_TTS_SAMPLE_RATE = 48000
 OPENAI_TTS_CHANNELS = 1
 
 
@@ -91,7 +93,11 @@ class TTS(tts.TTS):
         )
 
     def update_options(
-        self, *, model: TTSModels | None, voice: TTSVoices | None, speed: float | None
+        self,
+        *,
+        model: TTSModels | str | None,
+        voice: TTSVoices | str | None,
+        speed: float | None,
     ) -> None:
         self._opts.model = model or self._opts.model
         self._opts.voice = voice or self._opts.voice
@@ -100,8 +106,8 @@ class TTS(tts.TTS):
     @staticmethod
     def create_azure_client(
         *,
-        model: TTSModels = "tts-1",
-        voice: TTSVoices = "alloy",
+        model: TTSModels | str = "tts-1",
+        voice: TTSVoices | str = "alloy",
         speed: float = 1.0,
         azure_endpoint: str | None = None,
         azure_deployment: str | None = None,
@@ -142,7 +148,7 @@ class TTS(tts.TTS):
         self,
         text: str,
         *,
-        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+        conn_options: Optional[APIConnectOptions] = None,
     ) -> "ChunkedStream":
         return ChunkedStream(
             tts=self,
@@ -159,7 +165,7 @@ class ChunkedStream(tts.ChunkedStream):
         *,
         tts: TTS,
         input_text: str,
-        conn_options: APIConnectOptions,
+        conn_options: Optional[APIConnectOptions] = None,
         opts: _TTSOptions,
         client: openai.AsyncClient,
     ) -> None:
@@ -172,36 +178,36 @@ class ChunkedStream(tts.ChunkedStream):
             input=self.input_text,
             model=self._opts.model,
             voice=self._opts.voice,  # type: ignore
-            response_format="pcm",
+            response_format="opus",
             speed=self._opts.speed,
             timeout=httpx.Timeout(30, connect=self._conn_options.timeout),
         )
 
         request_id = utils.shortuuid()
-        audio_bstream = utils.audio.AudioByteStream(
+        decoder = utils.codecs.AudioStreamDecoder(
             sample_rate=OPENAI_TTS_SAMPLE_RATE,
             num_channels=OPENAI_TTS_CHANNELS,
         )
 
+        @utils.log_exceptions(logger=logger)
+        async def _decode_loop():
+            try:
+                async with oai_stream as stream:
+                    async for data in stream.iter_bytes():
+                        decoder.push(data)
+            finally:
+                decoder.end_input()
+
+        decode_task = asyncio.create_task(_decode_loop())
+
         try:
-            async with oai_stream as stream:
-                async for data in stream.iter_bytes():
-                    for frame in audio_bstream.write(data):
-                        self._event_ch.send_nowait(
-                            tts.SynthesizedAudio(
-                                frame=frame,
-                                request_id=request_id,
-                            )
-                        )
-
-                for frame in audio_bstream.flush():
-                    self._event_ch.send_nowait(
-                        tts.SynthesizedAudio(
-                            frame=frame,
-                            request_id=request_id,
-                        )
-                    )
-
+            emitter = tts.SynthesizedAudioEmitter(
+                event_ch=self._event_ch,
+                request_id=request_id,
+            )
+            async for frame in decoder:
+                emitter.push(frame)
+            emitter.flush()
         except openai.APITimeoutError:
             raise APITimeoutError()
         except openai.APIStatusError as e:
@@ -213,3 +219,6 @@ class ChunkedStream(tts.ChunkedStream):
             )
         except Exception as e:
             raise APIConnectionError() from e
+        finally:
+            await utils.aio.gracefully_cancel(decode_task)
+            await decoder.aclose()

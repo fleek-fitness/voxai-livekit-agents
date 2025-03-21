@@ -1,5 +1,53 @@
 # livekit-agents
 
+## 0.12.17
+
+### Patch Changes
+
+- use streaming AudioDecoder to handle compressed encoding - [#1584](https://github.com/livekit/agents/pull/1584) ([@davidzhao](https://github.com/davidzhao))
+
+- added a tts.prewarm method to start the connection pool early. - [#1587](https://github.com/livekit/agents/pull/1587) ([@davidzhao](https://github.com/davidzhao))
+
+- Raise ValueError in FallbackAdapter when streaming is not supported - [#1609](https://github.com/livekit/agents/pull/1609) ([@jayeshp19](https://github.com/jayeshp19))
+
+- fixed a bug in AudioStreamDecoder where it could fail on close - [#1587](https://github.com/livekit/agents/pull/1587) ([@davidzhao](https://github.com/davidzhao))
+
+- support for livekit noise cancellation plugin in VoicePipelineAgent and MultimodalAgent - [#1551](https://github.com/livekit/agents/pull/1551) ([@bcherry](https://github.com/bcherry))
+
+- fix: \_play_speech get stuck due to orphan speech handle - [#1555](https://github.com/livekit/agents/pull/1555) ([@SiyuanQi](https://github.com/SiyuanQi))
+
+## 0.12.16
+
+### Patch Changes
+
+- feat: connection pooling. speeds up generation with STT/TTS providers - [#1538](https://github.com/livekit/agents/pull/1538) ([@davidzhao](https://github.com/davidzhao))
+
+- handle process initialization failure - [#1556](https://github.com/livekit/agents/pull/1556) ([@theomonnom](https://github.com/theomonnom))
+
+## 0.12.15
+
+### Patch Changes
+
+- Revert "fix(cli): update main_file path to use current directory" - [#1509](https://github.com/livekit/agents/pull/1509) ([@theomonnom](https://github.com/theomonnom))
+
+## 0.12.14
+
+### Patch Changes
+
+- openai tts: switch to using Opus encoding - [#1494](https://github.com/livekit/agents/pull/1494) ([@davidzhao](https://github.com/davidzhao))
+
+- improve exception logging - [#1490](https://github.com/livekit/agents/pull/1490) ([@jayeshp19](https://github.com/jayeshp19))
+
+- fix interrupting nested speech from before_llm_cb - [#1504](https://github.com/livekit/agents/pull/1504) ([@longcw](https://github.com/longcw))
+
+- add cache tokens in `CompletionUsage` dataclass - [#1478](https://github.com/livekit/agents/pull/1478) ([@jayeshp19](https://github.com/jayeshp19))
+
+## 0.12.13
+
+### Patch Changes
+
+- Allow shutdown callbacks to take reason - [#1475](https://github.com/livekit/agents/pull/1475) ([@martin-purplefish](https://github.com/martin-purplefish))
+
 ## 0.12.12
 
 ### Patch Changes

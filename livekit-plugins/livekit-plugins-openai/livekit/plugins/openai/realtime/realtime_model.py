@@ -149,6 +149,8 @@ class ServerVadOptions:
 @dataclass
 class InputTranscriptionOptions:
     model: api_proto.InputTranscriptionModel | str
+    language: str | None = None
+    prompt: str | None = None
 
 
 @dataclass
@@ -870,6 +872,8 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
         self._pending_responses: dict[str, RealtimeResponse] = {}
         self._active_response_id: str | None = None
         self._response_create_fut: asyncio.Future[None] | None = None
+        self._playout_complete = asyncio.Event()
+        self._playout_complete.set()
 
         self._session_id = "not-connected"
         self.session_update()  # initial session init
@@ -885,6 +889,10 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
 
         self._send_ch.close()
         await self._main_atask
+
+    @property
+    def playout_complete(self) -> asyncio.Event:
+        return self._playout_complete
 
     @property
     def fnc_ctx(self) -> llm.FunctionContext | None:
@@ -970,6 +978,14 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
             input_audio_transcription_opts = {
                 "model": self._opts.input_audio_transcription.model,
             }
+            if self._opts.input_audio_transcription.language is not None:
+                input_audio_transcription_opts["language"] = (
+                    self._opts.input_audio_transcription.language
+                )
+            if self._opts.input_audio_transcription.prompt is not None:
+                input_audio_transcription_opts["prompt"] = (
+                    self._opts.input_audio_transcription.prompt
+                )
 
         session_data: api_proto.ClientEvent.SessionUpdateData = {
             "modalities": self._opts.modalities,
@@ -1290,6 +1306,8 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
         else:
             input_audio_transcription = InputTranscriptionOptions(
                 model=session["input_audio_transcription"]["model"],
+                language=session["input_audio_transcription"].get("language"),
+                prompt=session["input_audio_transcription"].get("prompt"),
             )
 
         self.emit(
@@ -1745,6 +1763,9 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
 
         called_fnc = fnc_call_info.execute()
         await called_fnc.task
+
+        # wait for the audio to be played before creating the response
+        await self._playout_complete.wait()
 
         tool_call = llm.ChatMessage.create_tool_from_called_function(called_fnc)
         logger.info(

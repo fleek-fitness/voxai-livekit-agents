@@ -191,6 +191,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         stt: stt.STT,
         llm: LLM,
         tts: tts.TTS,
+        noise_cancellation: rtc.NoiseCancellationOptions | None = None,
         turn_detector: _TurnDetector | None = None,
         chat_ctx: ChatContext | None = None,
         fnc_ctx: FunctionContext | None = None,
@@ -323,12 +324,16 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         self._last_final_transcript_time: float | None = None
         self._last_speech_time: float | None = None
 
+<<<<<<< HEAD
         ###########################################################
         # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
         self._node_type_after_transition = node_type_after_transition
         self._prompt_type_after_transition = prompt_type_after_transition
         # VOXAI_NATIVE_CODE: FOR FUNCTION CALL STREAMING
         ###########################################################
+=======
+        self._noise_cancellation = noise_cancellation
+>>>>>>> b7b480b2250842dc1cc03f68c9a5c47783c20c62
 
     @property
     def fnc_ctx(self) -> FunctionContext | None:
@@ -579,6 +584,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             stt=self._stt,
             participant=participant,
             transcription=self._opts.transcription.user_transcription,
+            noise_cancellation=self._noise_cancellation,
         )
 
         def _on_start_of_speech(ev: vad.VADEvent) -> None:
@@ -726,6 +732,9 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         self._agent_reply_task = asyncio.create_task(
             self._synthesize_answer_task(self._agent_reply_task, new_handle)
         )
+        self._agent_reply_task.add_done_callback(
+            lambda t: new_handle.cancel() if t.cancelled() else None
+        )
 
     @utils.log_exceptions(logger=logger)
     async def _synthesize_answer_task(
@@ -802,6 +811,8 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             SpeechDataContextVar.reset(tk)
 
     async def _play_speech(self, speech_handle: SpeechHandle) -> None:
+        await self._agent_publication.wait_for_subscription()
+
         fnc_done_fut = asyncio.Future[None]()
         playing_lock = asyncio.Lock()
         nested_speech_played = asyncio.Event()
@@ -843,24 +854,29 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
 
         nested_speech_task = asyncio.create_task(_play_nested_speech())
 
+        async def _stop_nesting_speech():
+            fnc_done_fut.set_result(None)
+            await nested_speech_task
+
         try:
             await speech_handle.wait_for_initialization()
         except asyncio.CancelledError:
+            await _stop_nesting_speech()
             return
-
-        await self._agent_publication.wait_for_subscription()
-
-        synthesis_handle = speech_handle.synthesis_handle
-        if synthesis_handle.interrupted:
-            return
-
-        user_question = speech_handle.user_question
 
         # wait for all pre-added nested speech to be played
         while speech_handle.nested_speech_handles:
             await nested_speech_played.wait()
 
         await playing_lock.acquire()
+        synthesis_handle = speech_handle.synthesis_handle
+        if synthesis_handle.interrupted:
+            playing_lock.release()
+            await _stop_nesting_speech()
+            return
+
+        user_question = speech_handle.user_question
+
         play_handle = synthesis_handle.play()
         join_fut = play_handle.join()
 
@@ -1119,8 +1135,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
 
         if not is_using_tools:
             # skip the function calls execution
-            fnc_done_fut.set_result(None)
-            await nested_speech_task
+            await _stop_nesting_speech()
             speech_handle._set_done()
             return
 
