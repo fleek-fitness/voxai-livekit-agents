@@ -1469,6 +1469,9 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         if llm_stream is False:
             return
 
+        if llm_stream == "FALSE_BUT_RETAIN_TRANSCRIPT":
+            return
+
         # Create and queue the speech
         speech_handle = SpeechHandle.create_assistant_speech(
             allow_interruptions=False, add_to_chat_ctx=True
