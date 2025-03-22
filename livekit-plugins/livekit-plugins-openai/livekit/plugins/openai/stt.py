@@ -182,6 +182,7 @@ class STT(stt.STT):
             detect_language=detect_language,
             prompt=prompt,
             temperature=temperature,
+            use_realtime=False,
         )
 
     @staticmethod
